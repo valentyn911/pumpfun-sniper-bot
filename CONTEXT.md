@@ -228,8 +228,8 @@ Key fields:
       "buy_slippage": 30, "sell_slippage": 30, "max_retries": 2,
       "take_profits": [{ "price_pct": 20, "position_pct": 95 }],
       "stop_losses":  [{ "price_pct": 30, "position_pct": 95 }],
-      "trailing_stop": { "enabled": true, "activation_pct": 10, "trail_size_pct": 20, "position_pct": 95 },
-      "filters": { "min_dev_buy_sol": 0.1, "min_ath_last5": 3000, "ath_require_all": true, "min_migrations_last5": 0 }
+      "trailing_stops": [{ "enabled": true, "activation_pct": 10, "trail_size_pct": 20, "position_pct": 95 }],
+      "filters": { "min_dev_buy_sol": 0.1, "min_ath_last5": 3000, "ath_require_all": true, "min_migrations_last5": 0, "min_entry_mc_usd": 0, "max_entry_mc_usd": 0 }
     }
   }
 }
@@ -265,6 +265,7 @@ Key fields:
 | Helius Staked TX (fast submission) | Via `HELIUS_STAKED_URL` |
 | Cashback-coin sell path (17 accounts) | See CLAUDE.md protocol notes |
 | Cleanup empty token accounts | `cleanup/manager.py` |
+| MC Range Entry Filter (min/max_entry_mc_usd) | Done — checked at buy moment via BC reserves + background SOL/USD price |
 
 ---
 
@@ -381,3 +382,34 @@ Data guards → Filter 3 (ATH) → Filter 4 (Mig) → Filter 5 (TX) → Filter 6
 - At activation: `state["peak"] = current_price`
 - Fire when: `current_price ≤ state["peak"] × (1 − trail_size_pct/100)`
 - Initial floor: `activation_price × (1 − trail_size_pct/100)` = `entry × (1+act/100) × (1−trail/100)`
+
+---
+
+## Session Update — 2026-05-23
+
+### Completed This Session
+
+- **Jito MEV tip**: `jito_tip_sol` field in all presets; tip instruction injected as first instruction in every tx (buy + sell); random tip account selected per-tx from 8 official Jito tip accounts; wired through `core/client.py` → `PlatformAwareBuyer/Seller` → `scanner_position_monitor._sell()` → dashboard Jito Tip field
+- **Dev buy display fix**: Was reading `virtual_sol_reserves` from BC account ~500 ms after event, inflated by other snipers' buys. Fix: use `solAmount` from PumpPortal event directly (new `dev_buy_sol` field on `TokenInfo`). Old `_fetch_bc_dev_buy()` kept as fallback for non-PumpPortal listeners.
+- **Market Cap Range entry filter**: `min_entry_mc_usd` / `max_entry_mc_usd` in filters (0 = disabled). Checked immediately before buy — reads BC reserves → price SOL/token × 1B supply × SOL/USD. SOL/USD served by a background `_sol_price_updater()` task (Binance, every 30 s) — zero latency on buy path. Dashboard inputs added to Entry Filters section.
+
+### Real Latency Numbers (from logs — 6,923 tokens, PumpPortal listener)
+
+| Stage | Avg | Min | Max |
+|---|---|---|---|
+| mint→Phase1 complete (GMGN + dev wallet) | 763 ms | 614 ms | 3024 ms |
+| Stream4 (getSignaturesForAddress ×N) | 151 ms | 78 ms | 1506 ms |
+| mint→all filters done (Phase1+sigs) | 890 ms | 615 ms | 3025 ms |
+| filters→send (buy tx) | logged — no buys yet (auto_trading=false) |
+| send→confirm | logged — no buys yet (auto_trading=false) |
+
+GMGN is the bottleneck (~763 ms avg). `[TIMING]` log lines now emitted for all 4 stages so buy-path latency will appear in logs once auto_trading is enabled.
+
+### `bot_config.json` breaking change
+
+`trailing_stop` single object → `trailing_stops` array. Backward compat kept in `scanner_position_monitor.py` (reads both forms).
+
+### Current Status
+
+- **auto_trading = false** — scan + alert only, no real buys
+- **All timing instrumented**: `[TIMING] mint→filters`, `filters→send`, `send→confirm`, `mint→confirm` logged on every buy

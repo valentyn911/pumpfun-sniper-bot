@@ -1163,6 +1163,10 @@ async def run_scanner(config_path: str) -> None:
         # -------------------------------------------------------------------
         # ALL FILTERS PASSED
         # -------------------------------------------------------------------
+        t_filters_passed = time.perf_counter()
+        logger.info(
+            f"[#{count}] [TIMING] mint→filters: {(t_filters_passed - t_total) * 1000:.0f}ms"
+        )
         asyncio.create_task(_update_bot_config({
             "stats": {"tokens_passed_filters": (
                 ((bot_cfg or {}).get("stats") or {}).get("tokens_passed_filters", 0) + 1
@@ -1227,10 +1231,19 @@ async def run_scanner(config_path: str) -> None:
                 else:
                     await _update_bot_config({"open_positions": open_pos + 1})
 
+                    t_send = time.perf_counter()
+                    logger.info(
+                        f"[#{count}] [TIMING] filters→send: {(t_send - t_filters_passed) * 1000:.0f}ms"
+                    )
                     logger.info(f"[#{count}] Buying token {str(token_info.mint)[:8]}...")
                     try:
                         buy_result = await fresh_buyer.execute(token_info)
+                        t_confirm = time.perf_counter()
                         if buy_result.success:
+                            logger.info(
+                                f"[#{count}] [TIMING] send→confirm: {(t_confirm - t_send) * 1000:.0f}ms"
+                                f" | mint→confirm: {(t_confirm - t_total) * 1000:.0f}ms"
+                            )
                             buy_block = (
                                 f"\n✅ КУПЛЕНО: {cur_buy_amount:.4f} SOL | Fee: {cur_priority_sol:.4f} SOL"
                             )
