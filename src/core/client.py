@@ -59,15 +59,24 @@ def set_loaded_accounts_data_size_limit(bytes_limit: int) -> Instruction:
 class SolanaClient:
     """Abstraction for Solana RPC client operations."""
 
-    def __init__(self, rpc_endpoint: str, max_rps: float = 25.0):
+    def __init__(
+        self,
+        rpc_endpoint: str,
+        max_rps: float = 25.0,
+        send_rpc_endpoint: str | None = None,
+    ):
         """Initialize Solana client with RPC endpoint.
 
         Args:
             rpc_endpoint: URL of the Solana RPC endpoint
             max_rps: Maximum RPC requests per second (rate limiter)
+            send_rpc_endpoint: Optional staked RPC URL used only for send_transaction
+                               (e.g. Helius staked endpoint). Falls back to rpc_endpoint.
         """
         self.rpc_endpoint = rpc_endpoint
+        self.send_rpc_endpoint = send_rpc_endpoint or rpc_endpoint
         self._client = None
+        self._send_client = None
         self._cached_blockhash: Hash | None = None
         self._blockhash_lock = asyncio.Lock()
         self._blockhash_updater_task = asyncio.create_task(
@@ -106,6 +115,19 @@ class SolanaClient:
             self._client = AsyncClient(self.rpc_endpoint)
         return self._client
 
+    async def get_send_client(self) -> AsyncClient:
+        """Get or create the AsyncClient used for sending transactions.
+
+        Uses send_rpc_endpoint (staked) if configured, otherwise falls back to
+        the regular rpc_endpoint.
+
+        Returns:
+            AsyncClient instance pointed at the send endpoint
+        """
+        if self._send_client is None:
+            self._send_client = AsyncClient(self.send_rpc_endpoint)
+        return self._send_client
+
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create the shared aiohttp session.
 
@@ -131,6 +153,10 @@ class SolanaClient:
         if self._client:
             await self._client.close()
             self._client = None
+
+        if self._send_client:
+            await self._send_client.close()
+            self._send_client = None
 
         if self._session and not self._session.closed:
             await self._session.close()
@@ -226,7 +252,7 @@ class SolanaClient:
         Returns:
             Transaction signature.
         """
-        client = await self.get_client()
+        client = await self.get_send_client()
 
         logger.info(
             f"Priority fee in microlamports: {priority_fee if priority_fee else 0}"

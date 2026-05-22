@@ -169,3 +169,11 @@ cython_debug/
 trades/trades.log
 # Mac OS X
 .DS_Store
+
+# Bot runtime
+logs/
+*.log.*
+bot_config.json
+skills-lock.json
+CONTEXT.md
+.agents/

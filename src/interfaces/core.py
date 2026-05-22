@@ -48,6 +48,7 @@ class TokenInfo:
     token_program_id: Pubkey | None = None  # Token or Token2022 program
     is_mayhem_mode: bool = False  # pump.fun mayhem mode flag
     is_cashback_coin: bool = False  # pump.fun cashback coin flag
+    virtual_sol_reserves: int | None = None  # pump.fun: lamports in curve after creation
 
     # Metadata
     creation_timestamp: float | None = None

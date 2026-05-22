@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PumpFun Bot</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--card:#161b22;--border:#30363d;--border2:#21262d;
+  --text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--green:#3fb950;
+  --red:#f85149;--yellow:#d29922;--purple:#bc8cff;
+  --input:#0d1117;--hover:#1f2937;
+}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;min-height:100vh}
+h2{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
+h3{font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin:16px 0 8px;padding-top:12px;border-top:1px solid var(--border2)}
+h3:first-of-type{margin-top:0;border-top:none;padding-top:0}
+
+/* Layout */
+.app{max-width:1100px;margin:0 auto;padding:16px}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+.logo{font-size:15px;font-weight:700;color:var(--text)}
+.logo span{color:var(--accent)}
+.server-status{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--red)}
+.dot.on{background:var(--green)}
+
+.grid-top{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px}
+
+/* Inputs */
+input[type=number],input[type=text],input[type=password]{
+  background:var(--input);border:1px solid var(--border);border-radius:6px;
+  color:var(--text);font-size:13px;padding:6px 10px;width:100%;outline:none;
+  transition:border-color .15s}
+input:focus{border-color:var(--accent)}
+input::-webkit-inner-spin-button{opacity:.5}
+label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;margin-top:10px}
+label:first-child{margin-top:0}
+.field-hint{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.4}
+
+/* Buttons */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  padding:7px 14px;border-radius:6px;font-size:12px;font-weight:500;
+  border:none;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn-primary{background:var(--accent);color:#000}
+.btn-primary:hover{filter:brightness(1.1)}
+.btn-green{background:var(--green);color:#000}
+.btn-green:hover{filter:brightness(1.1)}
+.btn-red{background:var(--red);color:#fff}
+.btn-red:hover{filter:brightness(1.1)}
+.btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--border)}
+.btn-ghost:hover{background:var(--hover);color:var(--text)}
+.btn-sm{padding:4px 10px;font-size:11px}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+
+/* Bot control */
+.control-row{display:flex;gap:8px;margin-bottom:12px}
+.status-badge{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;
+  border-radius:20px;font-size:11px;font-weight:600;background:#1a1a2e;border:1px solid var(--border)}
+.status-badge.running{color:var(--green);border-color:#2d5a2d}
+.status-badge.stopped{color:var(--muted)}
+
+/* Toggle */
+.toggle-row{display:flex;align-items:center;justify-content:space-between;margin-top:10px}
+.toggle-label{font-size:12px;color:var(--muted)}
+.toggle{position:relative;width:36px;height:20px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0;position:absolute}
+.slider{position:absolute;inset:0;background:#30363d;border-radius:20px;cursor:pointer;transition:.2s}
+.slider:before{content:'';position:absolute;width:14px;height:14px;left:3px;top:3px;
+  background:#fff;border-radius:50%;transition:.2s}
+.toggle input:checked+.slider{background:var(--accent)}
+.toggle input:checked+.slider:before{transform:translateX(16px)}
+
+/* Mode row */
+.mode-row{display:flex;align-items:center;gap:8px;margin-top:10px}
+.mode-label{font-size:12px;color:var(--muted);width:44px;flex-shrink:0}
+.mode-btn{padding:4px 12px;border-radius:4px;font-size:11px;font-weight:500;
+  border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer}
+.mode-btn.active{background:var(--accent);color:#000;border-color:var(--accent)}
+#nTradesWrap{display:none}
+
+/* Wallet */
+.pubkey{font-size:11px;font-family:monospace;color:var(--accent);word-break:break-all;
+  background:#0a0f1a;padding:6px 8px;border-radius:4px;margin-top:4px;border:1px solid var(--border2)}
+.balance-row{display:flex;align-items:center;justify-content:space-between;margin-top:8px}
+.balance-val{font-size:18px;font-weight:700;color:var(--text)}
+.balance-label{font-size:11px;color:var(--muted)}
+.btn-row{display:flex;gap:6px;margin-top:8px}
+
+/* Presets */
+.tabs{display:flex;gap:0;margin-bottom:0;border-bottom:1px solid var(--border)}
+.tab{padding:8px 16px;font-size:12px;font-weight:500;color:var(--muted);cursor:pointer;
+  border-bottom:2px solid transparent;margin-bottom:-1px;transition:.15s}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab-content{display:none;padding-top:16px}
+.tab-content.active{display:block}
+.preset-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.active-badge{font-size:10px;padding:2px 8px;border-radius:10px;background:#1a2a1a;
+  color:var(--green);border:1px solid #2d5a2d;font-weight:600}
+
+/* Two-column preset layout */
+.preset-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 20px}
+.preset-col{}
+
+/* TP/SL rows */
+.tp-row,.sl-row{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+.tp-row input,.sl-row input{width:72px;flex-shrink:0}
+.row-label{font-size:11px;color:var(--muted);white-space:nowrap}
+.remove-btn{width:20px;height:20px;border-radius:4px;border:none;background:#2a1515;
+  color:var(--red);cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.remove-btn:hover{background:#3a2020}
+.add-btn{margin-top:4px;font-size:11px;padding:4px 10px}
+.tp-summary{font-size:11px;color:var(--muted);margin-top:8px;padding:6px 8px;
+  background:#0a0f1a;border-radius:4px;border:1px solid var(--border2)}
+.tp-summary b{color:var(--green)}
+.tp-summary .moonbag{color:var(--purple)}
+
+/* Trailing stop */
+.trail-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
+.trail-grid label{margin-top:0}
+
+/* Stats */
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:8px}
+.stat-card{background:#0d1117;border:1px solid var(--border2);border-radius:6px;padding:12px;text-align:center}
+.stat-val{font-size:22px;font-weight:700;color:var(--text)}
+.stat-label{font-size:10px;color:var(--muted);margin-top:2px;text-transform:uppercase;letter-spacing:.05em}
+
+/* Save bar */
+.save-bar{display:flex;justify-content:flex-end;margin-top:14px;padding-top:12px;border-top:1px solid var(--border2)}
+
+/* Notifications */
+#toast{position:fixed;bottom:20px;right:20px;z-index:999;display:flex;flex-direction:column;gap:8px}
+.toast-msg{padding:10px 14px;border-radius:6px;font-size:12px;font-weight:500;
+  animation:fadeIn .2s ease;max-width:280px}
+.toast-msg.ok{background:#1a3a1a;color:var(--green);border:1px solid #2d5a2d}
+.toast-msg.err{background:#2a1515;color:var(--red);border:1px solid #5a2d2d}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header>
+    <div class="logo">Pump<span>Fun</span> Bot</div>
+    <div class="server-status">
+      <div class="dot on" id="serverDot"></div>
+      <span id="serverLabel">Connected</span>
+    </div>
+  </header>
+
+  <!-- Top grid: Bot Control + Wallet -->
+  <div class="grid-top">
+
+    <!-- BLOCK 1 — BOT CONTROL -->
+    <div class="card">
+      <h2>Bot Control</h2>
+      <div class="control-row">
+        <button class="btn btn-green" id="btnStart" onclick="startBot()">▶ Start Bot</button>
+        <button class="btn btn-red" id="btnStop" onclick="stopBot()">■ Stop Bot</button>
+        <span class="status-badge stopped" id="botStatus">
+          <span class="dot"></span> Stopped
+        </span>
+      </div>
+
+      <div class="toggle-row">
+        <span class="toggle-label">Auto Trading</span>
+        <label class="toggle">
+          <input type="checkbox" id="autoTrading" onchange="onAutoTradingChange()">
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="mode-row">
+        <span class="mode-label">Mode:</span>
+        <button class="mode-btn active" id="modeInfinite" onclick="setMode('infinite')">Infinite</button>
+        <button class="mode-btn" id="modeN" onclick="setMode('n')">N trades</button>
+        <div id="nTradesWrap">
+          <input type="number" id="maxTrades" min="1" value="10" style="width:70px">
+        </div>
+      </div>
+
+      <label style="margin-top:12px">Max Concurrent Positions</label>
+      <input type="number" id="maxPositions" min="1" value="1" style="width:100px" oninput="saveControlSettings()">
+      <div class="field-hint">Bot will open max <span id="maxPosHint">1</span> position(s) simultaneously.<br>
+        New buys are paused when limit is reached and resume after a position closes.</div>
+    </div>
+
+    <!-- BLOCK 2 — WALLET -->
+    <div class="card">
+      <h2>Wallet</h2>
+      <label>Private Key</label>
+      <input type="password" id="privateKey" placeholder="base58 private key…" autocomplete="off">
+      <div class="btn-row">
+        <button class="btn btn-primary btn-sm" onclick="saveKey()">Save Key</button>
+        <button class="btn btn-ghost btn-sm" onclick="toggleKeyVisibility()">Show / Hide</button>
+      </div>
+
+      <div style="margin-top:12px">
+        <span style="font-size:11px;color:var(--muted)">Public Address</span>
+        <div class="pubkey" id="pubkeyDisplay">—</div>
+      </div>
+
+      <div class="balance-row">
+        <div>
+          <div class="balance-label">Balance</div>
+          <div class="balance-val" id="balanceDisplay">—</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="refreshBalance()">↻ Refresh</button>
+      </div>
+    </div>
+
+  </div><!-- end grid-top -->
+
+  <!-- BLOCK 3 — PRESETS -->
+  <div class="card" style="margin-bottom:12px">
+    <h2>Presets</h2>
+    <div class="tabs">
+      <div class="tab active" id="tab-1" onclick="switchTab(1)">Preset 1</div>
+      <div class="tab" id="tab-2" onclick="switchTab(2)">Preset 2</div>
+      <div class="tab" id="tab-3" onclick="switchTab(3)">Preset 3</div>
+    </div>
+
+    <!-- Preset 1 -->
+    <div class="tab-content active" id="preset-1">
+      <div class="preset-header">
+        <span class="active-badge" id="activeBadge1" style="display:none">✓ ACTIVE</span>
+        <button class="btn btn-ghost btn-sm" onclick="activatePreset(1)">Activate</button>
+      </div>
+      <div class="preset-grid">
+        <div class="preset-col" id="entry-col-1"><!-- entry filled by JS --></div>
+        <div class="preset-col" id="filters-col-1"><!-- filters + trailing by JS --></div>
+      </div>
+      <div id="tp-sl-1"><!-- TP/SL filled by JS --></div>
+      <div class="save-bar">
+        <button class="btn btn-primary" onclick="savePreset(1)">Save Preset</button>
+      </div>
+    </div>
+
+    <!-- Preset 2 -->
+    <div class="tab-content" id="preset-2">
+      <div class="preset-header">
+        <span class="active-badge" id="activeBadge2" style="display:none">✓ ACTIVE</span>
+        <button class="btn btn-ghost btn-sm" onclick="activatePreset(2)">Activate</button>
+      </div>
+      <div class="preset-grid">
+        <div class="preset-col" id="entry-col-2"></div>
+        <div class="preset-col" id="filters-col-2"></div>
+      </div>
+      <div id="tp-sl-2"></div>
+      <div class="save-bar">
+        <button class="btn btn-primary" onclick="savePreset(2)">Save Preset</button>
+      </div>
+    </div>
+
+    <!-- Preset 3 -->
+    <div class="tab-content" id="preset-3">
+      <div class="preset-header">
+        <span class="active-badge" id="activeBadge3" style="display:none">✓ ACTIVE</span>
+        <button class="btn btn-ghost btn-sm" onclick="activatePreset(3)">Activate</button>
+      </div>
+      <div class="preset-grid">
+        <div class="preset-col" id="entry-col-3"></div>
+        <div class="preset-col" id="filters-col-3"></div>
+      </div>
+      <div id="tp-sl-3"></div>
+      <div class="save-bar">
+        <button class="btn btn-primary" onclick="savePreset(3)">Save Preset</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- BLOCK 4 — STATS -->
+  <div class="card">
+    <h2>Stats (Today)</h2>
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-val" id="statFound">0</div>
+        <div class="stat-label">Tokens Found</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-val" id="statPassed">0</div>
+        <div class="stat-label">Passed Filters</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-val" id="statBuys">0</div>
+        <div class="stat-label">Buys Executed</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-val" id="statPositions">0 / <span id="statMaxPos">1</span></div>
+        <div class="stat-label">Open Positions</div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- end .app -->
+
+<div id="toast"></div>
+
+<script>
+// ============================================================
+// State
+// ============================================================
+let cfg = null;
+let currentPreset = 1;
+let balanceTimer = null;
+let statusTimer = null;
+
+// ============================================================
+// Init
+// ============================================================
+async function init() {
+  try {
+    cfg = await api('GET', '/api/config');
+    populateAll();
+    pollStatus();
+    pollBalance();
+    statusTimer = setInterval(pollStatus, 3000);
+    balanceTimer = setInterval(pollBalance, 30000);
+    document.getElementById('serverDot').className = 'dot on';
+    document.getElementById('serverLabel').textContent = 'Connected';
+  } catch(e) {
+    document.getElementById('serverDot').className = 'dot';
+    document.getElementById('serverLabel').textContent = 'Server offline — run: python bot_server.py';
+  }
+}
+
+// ============================================================
+// API helper
+// ============================================================
+async function api(method, path, body) {
+  const opts = { method, headers: {'Content-Type':'application/json'} };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
+  return r.json();
+}
+
+// ============================================================
+// Populate UI from cfg
+// ============================================================
+function populateAll() {
+  if (!cfg) return;
+
+  // Bot control
+  document.getElementById('autoTrading').checked = !!cfg.auto_trading;
+  setMode(cfg.mode || 'infinite', false);
+  document.getElementById('maxTrades').value = cfg.max_trades || 10;
+  document.getElementById('maxPositions').value = cfg.max_concurrent_positions || 1;
+  updateMaxPosHint();
+
+  // Active preset badge
+  updateActiveBadges();
+
+  // Presets
+  [1, 2, 3].forEach(n => buildPresetUI(n));
+}
+
+function updateActiveBadges() {
+  [1, 2, 3].forEach(n => {
+    const badge = document.getElementById(`activeBadge${n}`);
+    if (badge) badge.style.display = n === cfg.active_preset ? 'inline-flex' : 'none';
+  });
+}
+
+// ============================================================
+// Preset UI builder
+// ============================================================
+function buildPresetUI(n) {
+  const p = (cfg.presets || {})[String(n)] || {};
+  buildEntryCol(n, p);
+  buildFiltersCol(n, p);
+  buildTpSl(n, p);
+  updateTrailingHint(n);  // populate hint with initial values
+}
+
+function buildEntryCol(n, p) {
+  const el = document.getElementById(`entry-col-${n}`);
+  el.innerHTML = `
+<h3>Entry</h3>
+<label>Buy Amount (SOL)</label>
+<input type="number" id="p${n}_buy_amount" value="${p.buy_amount_sol ?? 0.01}" min="0" step="0.001">
+<label>Priority Fee (SOL)</label>
+<input type="number" id="p${n}_priority_fee" value="${p.priority_fee_sol ?? 0.001}" min="0" step="0.0001">
+<label>Gas Fee (SOL)</label>
+<input type="number" id="p${n}_gas_fee" value="${p.gas_fee_sol ?? 0.000005}" min="0" step="0.000001">
+<label>Buy Slippage (%)</label>
+<input type="number" id="p${n}_buy_slippage" value="${p.buy_slippage ?? 30}" min="0" max="100">
+<label>Sell Slippage (%)</label>
+<input type="number" id="p${n}_sell_slippage" value="${p.sell_slippage ?? 25}" min="0" max="100">
+<label>Max Retries</label>
+<input type="number" id="p${n}_max_retries" value="${p.max_retries ?? 1}" min="1">
+`;
+}
+
+function buildFiltersCol(n, p) {
+  const f = p.filters || {};
+  const ts = p.trailing_stop || {};
+  const el = document.getElementById(`filters-col-${n}`);
+  el.innerHTML = `
+<h3>Entry Filters</h3>
+<label>Min Dev Buy (SOL)</label>
+<input type="number" id="p${n}_min_dev_buy" value="${f.min_dev_buy_sol ?? 0.1}" min="0" step="0.01">
+<label>Min ATH of last 5 tokens ($)</label>
+<input type="number" id="p${n}_min_ath" value="${f.min_ath_last5 ?? 0}" min="0">
+<div class="toggle-row" style="margin-top:6px;margin-bottom:2px">
+  <span class="toggle-label" id="p${n}_ath_mode_lbl">${f.ath_require_all ? 'Every token' : 'Any 1 of 5'}</span>
+  <label class="toggle">
+    <input type="checkbox" id="p${n}_ath_require_all" ${f.ath_require_all ? 'checked' : ''} onchange="onAthModeToggle(${n})">
+    <span class="slider"></span>
+  </label>
+</div>
+<label>Min Migrations in last 5 (0–5)</label>
+<input type="number" id="p${n}_min_mig" value="${f.min_migrations_last5 ?? 0}" min="0" max="5">
+
+<h3>Trailing Stop</h3>
+<div class="toggle-row" style="margin-top:0;margin-bottom:8px">
+  <span class="toggle-label">Enabled</span>
+  <label class="toggle">
+    <input type="checkbox" id="p${n}_ts_enabled" ${ts.enabled ? 'checked' : ''} onchange="onTrailingToggle(${n})">
+    <span class="slider"></span>
+  </label>
+</div>
+<div id="p${n}_ts_fields" style="display:${ts.enabled ? 'block' : 'none'}">
+  <div class="trail-grid">
+    <div>
+      <label>Activation (+%)</label>
+      <input type="number" id="p${n}_ts_activation" value="${ts.activation_pct ?? 30}" min="0" placeholder="%" oninput="updateTrailingHint(${n})">
+    </div>
+    <div>
+      <label>Trail Size (%)</label>
+      <input type="number" id="p${n}_ts_trail" value="${ts.trail_size_pct ?? 20}" min="0" placeholder="%" oninput="updateTrailingHint(${n})">
+    </div>
+    <div>
+      <label>Position Size (%)</label>
+      <input type="number" id="p${n}_ts_position" value="${ts.position_pct ?? 50}" min="0" max="100" placeholder="%" oninput="updateTrailingHint(${n})">
+    </div>
+  </div>
+  <div class="field-hint" id="p${n}_ts_hint" style="margin-top:6px"></div>
+</div>
+`;
+}
+
+function onTrailingToggle(n) {
+  const en = document.getElementById(`p${n}_ts_enabled`).checked;
+  document.getElementById(`p${n}_ts_fields`).style.display = en ? 'block' : 'none';
+}
+
+function onAthModeToggle(n) {
+  const on = document.getElementById(`p${n}_ath_require_all`).checked;
+  document.getElementById(`p${n}_ath_mode_lbl`).textContent = on ? 'Every token' : 'Any 1 of 5';
+}
+
+function updateTrailingHint(n) {
+  const act  = parseFloat(document.getElementById(`p${n}_ts_activation`)?.value) || 0;
+  const trail = parseFloat(document.getElementById(`p${n}_ts_trail`)?.value) || 0;
+  const pos  = parseFloat(document.getElementById(`p${n}_ts_position`)?.value) || 0;
+  const el = document.getElementById(`p${n}_ts_hint`);
+  if (!el) return;
+  el.innerHTML =
+    `Activates when price rises <b>+${act}%</b> from entry. ` +
+    `Stop trails at <b>${trail}%</b> below entry price. ` +
+    `Closes <b>${pos}%</b> of remaining position.`;
+}
+
+function buildTpSl(n, p) {
+  const el = document.getElementById(`tp-sl-${n}`);
+  const tps = p.take_profits || [];
+  const sls = p.stop_losses || [];
+
+  let tpRows = tps.map((tp, i) => makeTpRow(n, i, tp.price_pct, tp.position_pct)).join('');
+  let slRows = sls.map((sl, i) => makeSlRow(n, i, sl.price_pct, sl.position_pct)).join('');
+
+  el.innerHTML = `
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:0 20px">
+<div>
+<h3>Take Profit <span style="color:var(--muted);font-weight:400">(up to 8)</span></h3>
+<div id="tp-rows-${n}">${tpRows}</div>
+<button class="btn btn-ghost add-btn" onclick="addTpRow(${n})">+ Add TP</button>
+<div class="tp-summary" id="tp-summary-${n}"></div>
+</div>
+<div>
+<h3>Stop Loss <span style="color:var(--muted);font-weight:400">(up to 3)</span></h3>
+<div id="sl-rows-${n}">${slRows}</div>
+<button class="btn btn-ghost add-btn" onclick="addSlRow(${n})">+ Add SL</button>
+</div>
+</div>`;
+
+  updateTpSummary(n);
+}
+
+function makeTpRow(n, i, price, pos) {
+  return `<div class="tp-row" id="tp-row-${n}-${i}">
+  <span class="row-label">+</span>
+  <input type="number" id="tp-price-${n}-${i}" value="${price ?? 50}" min="0.1" step="1" placeholder="%" title="Price increase %" oninput="updateTpSummary(${n})">
+  <span class="row-label">% |</span>
+  <input type="number" id="tp-pos-${n}-${i}" value="${pos ?? 50}" min="1" max="100" step="1" placeholder="%" title="Position %" oninput="updateTpSummary(${n})">
+  <span class="row-label">% pos</span>
+  <button class="remove-btn" onclick="removeTpRow(${n},${i})" title="Remove">×</button>
+</div>`;
+}
+
+function makeSlRow(n, i, price, pos) {
+  return `<div class="sl-row" id="sl-row-${n}-${i}">
+  <span class="row-label">-</span>
+  <input type="number" id="sl-price-${n}-${i}" value="${price ?? 30}" min="0.1" step="1" placeholder="%" title="Price drop %">
+  <span class="row-label">% |</span>
+  <input type="number" id="sl-pos-${n}-${i}" value="${pos ?? 100}" min="1" max="100" step="1" placeholder="%" title="Position %">
+  <span class="row-label">% pos</span>
+  <button class="remove-btn" onclick="removeSlRow(${n},${i})" title="Remove">×</button>
+</div>`;
+}
+
+function addTpRow(n) {
+  const container = document.getElementById(`tp-rows-${n}`);
+  const rows = container.querySelectorAll('.tp-row');
+  if (rows.length >= 8) { toast('Max 8 take profits', true); return; }
+  const i = Date.now();
+  container.insertAdjacentHTML('beforeend', makeTpRow(n, i, 50, 50));
+  updateTpSummary(n);
+}
+
+function removeTpRow(n, i) {
+  const el = document.getElementById(`tp-row-${n}-${i}`);
+  if (el) el.remove();
+  updateTpSummary(n);
+}
+
+function addSlRow(n) {
+  const container = document.getElementById(`sl-rows-${n}`);
+  const rows = container.querySelectorAll('.sl-row');
+  if (rows.length >= 3) { toast('Max 3 stop losses', true); return; }
+  const i = Date.now();
+  container.insertAdjacentHTML('beforeend', makeSlRow(n, i, 30, 100));
+}
+
+function removeSlRow(n, i) {
+  const el = document.getElementById(`sl-row-${n}-${i}`);
+  if (el) el.remove();
+}
+
+function updateTpSummary(n) {
+  const container = document.getElementById(`tp-rows-${n}`);
+  const rows = container.querySelectorAll('.tp-row');
+  let total = 0;
+  rows.forEach(row => {
+    const id = row.id.split('-').slice(-1)[0];
+    const pos = parseFloat(document.getElementById(`tp-pos-${n}-${id}`)?.value || 0);
+    total += pos;
+  });
+  const moonbag = Math.max(0, 100 - total);
+  const el = document.getElementById(`tp-summary-${n}`);
+  if (el) el.innerHTML = `Total closed: <b>${total.toFixed(0)}%</b> &nbsp;|&nbsp; Moonbag: <span class="moonbag"><b>${moonbag.toFixed(0)}%</b></span> stays in wallet`;
+  if (total > 100) el.style.color = 'var(--red)';
+  else el.style.color = '';
+}
+
+// ============================================================
+// Read preset from DOM
+// ============================================================
+function readPreset(n) {
+  function v(id) {
+    const el = document.getElementById(id);
+    return el ? parseFloat(el.value) || 0 : 0;
+  }
+  function checked(id) {
+    const el = document.getElementById(id);
+    return el ? el.checked : false;
+  }
+
+  // Read TP rows
+  const tpContainer = document.getElementById(`tp-rows-${n}`);
+  const tps = [];
+  if (tpContainer) {
+    tpContainer.querySelectorAll('.tp-row').forEach(row => {
+      const id = row.id.split('-').slice(-1)[0];
+      const price = parseFloat(document.getElementById(`tp-price-${n}-${id}`)?.value);
+      const pos = parseFloat(document.getElementById(`tp-pos-${n}-${id}`)?.value);
+      if (!isNaN(price) && !isNaN(pos) && price > 0 && pos > 0) {
+        tps.push({ price_pct: price, position_pct: pos });
+      }
+    });
+  }
+
+  // Read SL rows
+  const slContainer = document.getElementById(`sl-rows-${n}`);
+  const sls = [];
+  if (slContainer) {
+    slContainer.querySelectorAll('.sl-row').forEach(row => {
+      const id = row.id.split('-').slice(-1)[0];
+      const price = parseFloat(document.getElementById(`sl-price-${n}-${id}`)?.value);
+      const pos = parseFloat(document.getElementById(`sl-pos-${n}-${id}`)?.value);
+      if (!isNaN(price) && !isNaN(pos) && price > 0 && pos > 0) {
+        sls.push({ price_pct: price, position_pct: pos });
+      }
+    });
+  }
+
+  return {
+    name: `Preset ${n}`,
+    buy_amount_sol: v(`p${n}_buy_amount`),
+    priority_fee_sol: v(`p${n}_priority_fee`),
+    gas_fee_sol: v(`p${n}_gas_fee`),
+    buy_slippage: v(`p${n}_buy_slippage`),
+    sell_slippage: v(`p${n}_sell_slippage`),
+    max_retries: Math.max(1, v(`p${n}_max_retries`)),
+    take_profits: tps,
+    stop_losses: sls,
+    trailing_stop: {
+      enabled: checked(`p${n}_ts_enabled`),
+      activation_pct: v(`p${n}_ts_activation`),
+      trail_size_pct: v(`p${n}_ts_trail`),
+      position_pct: v(`p${n}_ts_position`),
+    },
+    filters: {
+      min_dev_buy_sol: v(`p${n}_min_dev_buy`),
+      min_ath_last5: v(`p${n}_min_ath`),
+      ath_require_all: checked(`p${n}_ath_require_all`),
+      min_migrations_last5: Math.round(v(`p${n}_min_mig`)),
+    },
+  };
+}
+
+// ============================================================
+// Save preset
+// ============================================================
+async function savePreset(n) {
+  if (!cfg) return;
+  const preset = readPreset(n);
+
+  // Validate TP sum
+  const tpTotal = preset.take_profits.reduce((s, tp) => s + tp.position_pct, 0);
+  if (tpTotal > 100) { toast('Total TP position % exceeds 100%', true); return; }
+
+  cfg.presets = cfg.presets || {};
+  cfg.presets[String(n)] = preset;
+
+  const r = await api('POST', '/api/config', cfg);
+  if (r.success) toast(`Preset ${n} saved`);
+  else toast('Save failed: ' + (r.error || ''), true);
+}
+
+// ============================================================
+// Activate preset
+// ============================================================
+async function activatePreset(n) {
+  if (!cfg) return;
+  cfg.active_preset = n;
+  const r = await api('POST', '/api/config', cfg);
+  if (r.success) {
+    updateActiveBadges();
+    toast(`Preset ${n} activated`);
+  }
+}
+
+// ============================================================
+// Bot control
+// ============================================================
+async function startBot() {
+  document.getElementById('btnStart').disabled = true;
+  const r = await api('POST', '/api/start');
+  document.getElementById('btnStart').disabled = false;
+  toast(r.success ? r.message : r.message, !r.success);
+  pollStatus();
+}
+
+async function stopBot() {
+  document.getElementById('btnStop').disabled = true;
+  const r = await api('POST', '/api/stop');
+  document.getElementById('btnStop').disabled = false;
+  toast(r.message, !r.success);
+  pollStatus();
+}
+
+// ============================================================
+// Status poll
+// ============================================================
+async function pollStatus() {
+  try {
+    const s = await api('GET', '/api/status');
+    const badge = document.getElementById('botStatus');
+    if (s.running) {
+      badge.className = 'status-badge running';
+      badge.innerHTML = '<span class="dot on"></span> Running';
+    } else {
+      badge.className = 'status-badge stopped';
+      badge.innerHTML = '<span class="dot"></span> Stopped';
+    }
+    const st = s.stats || {};
+    document.getElementById('statFound').textContent = st.tokens_found_today ?? 0;
+    document.getElementById('statPassed').textContent = st.tokens_passed_filters ?? 0;
+    document.getElementById('statBuys').textContent = st.buys_executed ?? 0;
+    const maxP = s.max_concurrent_positions ?? 1;
+    document.getElementById('statPositions').textContent = `${s.open_positions ?? 0} / ${maxP}`;
+    document.getElementById('statMaxPos').textContent = maxP;
+  } catch(e) {}
+}
+
+// ============================================================
+// Balance
+// ============================================================
+async function pollBalance() {
+  try {
+    const r = await api('GET', '/api/balance');
+    document.getElementById('balanceDisplay').textContent =
+      r.balance != null ? r.balance.toFixed(4) + ' SOL' : '—';
+    if (r.pubkey) document.getElementById('pubkeyDisplay').textContent = r.pubkey;
+  } catch(e) {}
+}
+
+async function refreshBalance() { await pollBalance(); toast('Balance refreshed'); }
+
+// ============================================================
+// Wallet
+// ============================================================
+async function saveKey() {
+  const key = document.getElementById('privateKey').value.trim();
+  if (!key) { toast('Enter a private key first', true); return; }
+  const r = await api('POST', '/api/save-key', { key });
+  if (r.success) {
+    toast('Key saved to .env');
+    document.getElementById('privateKey').value = '';
+    if (r.pubkey) document.getElementById('pubkeyDisplay').textContent = r.pubkey;
+    pollBalance();
+  } else {
+    toast('Error: ' + (r.error || 'unknown'), true);
+  }
+}
+
+function toggleKeyVisibility() {
+  const el = document.getElementById('privateKey');
+  el.type = el.type === 'password' ? 'text' : 'password';
+}
+
+// ============================================================
+// Mode / settings helpers
+// ============================================================
+function setMode(mode, saveIt = true) {
+  currentMode = mode;
+  document.getElementById('modeInfinite').className = 'mode-btn' + (mode === 'infinite' ? ' active' : '');
+  document.getElementById('modeN').className = 'mode-btn' + (mode === 'n' ? ' active' : '');
+  document.getElementById('nTradesWrap').style.display = mode === 'n' ? 'inline-flex' : 'none';
+  if (saveIt && cfg) { cfg.mode = mode; debounceSaveControl(); }
+}
+
+function onAutoTradingChange() {
+  if (!cfg) return;
+  cfg.auto_trading = document.getElementById('autoTrading').checked;
+  debounceSaveControl();
+}
+
+function updateMaxPosHint() {
+  const v = document.getElementById('maxPositions').value;
+  document.getElementById('maxPosHint').textContent = v;
+}
+
+function saveControlSettings() {
+  updateMaxPosHint();
+  if (!cfg) return;
+  cfg.max_concurrent_positions = parseInt(document.getElementById('maxPositions').value) || 1;
+  cfg.max_trades = parseInt(document.getElementById('maxTrades').value) || 10;
+  debounceSaveControl();
+}
+
+let _saveTimer = null;
+function debounceSaveControl() {
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(async () => {
+    if (!cfg) return;
+    await api('POST', '/api/config', cfg);
+  }, 600);
+}
+
+// ============================================================
+// Tab switching
+// ============================================================
+function switchTab(n) {
+  [1, 2, 3].forEach(i => {
+    document.getElementById(`tab-${i}`).className = 'tab' + (i === n ? ' active' : '');
+    document.getElementById(`preset-${i}`).className = 'tab-content' + (i === n ? ' active' : '');
+  });
+  currentPreset = n;
+}
+
+// ============================================================
+// Toast notifications
+// ============================================================
+function toast(msg, isErr = false) {
+  const container = document.getElementById('toast');
+  const el = document.createElement('div');
+  el.className = 'toast-msg ' + (isErr ? 'err' : 'ok');
+  el.textContent = msg;
+  container.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+// ============================================================
+// Boot
+// ============================================================
+init();
+</script>
+</body>
+</html>

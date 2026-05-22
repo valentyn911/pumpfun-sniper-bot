@@ -276,6 +276,7 @@ class PumpFunEventParser(EventParser):
                         token_program_id=token_program_id,
                         is_mayhem_mode=fields.get("is_mayhem_mode", False),
                         is_cashback_coin=fields.get("is_cashback_enabled", False),
+                        virtual_sol_reserves=fields.get("virtual_sol_reserves"),
                         creation_timestamp=monotonic(),
                     )
 
