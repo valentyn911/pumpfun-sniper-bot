@@ -60,13 +60,14 @@ class PumpFunPumpPortalProcessor:
             creator_str = token_data.get("traderPublicKey")  # Maps to user field
             uri = token_data.get("uri", "")
 
-            # Additional fields available from PumpPortal but not currently used:
-            # - initialBuy: Initial buy amount in tokens
-            # - solAmount: SOL amount spent on initial buy
-            # - vSolInBondingCurve: Virtual SOL in bonding curve
-            # - vTokensInBondingCurve: Virtual tokens in bonding curve
-            # - marketCapSol: Market cap in SOL
-            # - signature: Transaction signature
+            # solAmount = actual SOL the dev spent on the initial buy in the create tx.
+            # Use this directly — reading virtual_sol_reserves from the BC account
+            # is unreliable because other snipers buy within milliseconds, inflating
+            # the reserves before our RPC call lands.
+            raw_sol_amount = token_data.get("solAmount")
+            dev_buy_sol: float | None = (
+                float(raw_sol_amount) if raw_sol_amount is not None else None
+            )
 
             if not all([name, symbol, mint_str, bonding_curve_str, creator_str]):
                 logger.warning("Missing required fields in PumpPortal token data")
@@ -107,6 +108,7 @@ class PumpFunPumpPortalProcessor:
                 creator=creator,
                 creator_vault=creator_vault,
                 token_program_id=token_program_id,
+                dev_buy_sol=dev_buy_sol,
             )
 
         except Exception:

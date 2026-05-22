@@ -49,6 +49,7 @@ class TokenInfo:
     is_mayhem_mode: bool = False  # pump.fun mayhem mode flag
     is_cashback_coin: bool = False  # pump.fun cashback coin flag
     virtual_sol_reserves: int | None = None  # pump.fun: lamports in curve after creation
+    dev_buy_sol: float | None = None  # actual SOL spent by dev at launch (from event, not curve state)
 
     # Metadata
     creation_timestamp: float | None = None

@@ -762,9 +762,13 @@ async def run_scanner(config_path: str) -> None:
         # Net result: total latency = max(GMGN, dev_buy) → not GMGN + dev_buy.
         # -------------------------------------------------------------------
         t_fetch = time.perf_counter()
+        # If the listener already provided dev_buy_sol (e.g. PumpPortal solAmount),
+        # skip the BC account RPC call — reading virtual_sol_reserves at this point
+        # would include other snipers' buys that happened in the ~500 ms since creation.
         task_bc_buy: asyncio.Task = asyncio.create_task(
-            _fetch_bc_dev_buy(bc_str, rpc) if (bc_str and rpc)
-            else asyncio.sleep(0, result=None),
+            asyncio.sleep(0, result=token_info.dev_buy_sol)
+            if token_info.dev_buy_sol is not None
+            else (_fetch_bc_dev_buy(bc_str, rpc) if (bc_str and rpc) else asyncio.sleep(0, result=None))
         )
         task_mint: asyncio.Task = asyncio.create_task(
             _check_mint_freeze(mint_str, rpc) if rpc
