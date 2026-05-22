@@ -419,13 +419,82 @@ async def _fetch_token_signatures_batch(
 # ---------------------------------------------------------------------------
 
 
-async def _get_gmgn_dev_tokens(dev_wallet: str, current_mint: str = "") -> list[TokenHistory]:
-    """Fetch tokens created by dev wallet via gmgn-cli subprocess.
+_GMGN_API_KEY: str = os.environ.get("GMGN_API_KEY", "")
+_GMGN_BASE_URL: str = "https://openapi.gmgn.ai/v1/user/created_tokens"
 
-    Raises RuntimeError on timeout or subprocess failure so the caller can
-    distinguish a communication error from a dev with no token history.
-    Returns [] (empty list) when GMGN succeeded but dev has no prior tokens.
+
+def _parse_gmgn_tokens(
+    raw_tokens: list[dict], current_mint: str
+) -> list[TokenHistory]:
+    """Sort desc by create_timestamp, exclude current_mint, return up to 5."""
+    sorted_tokens = sorted(
+        [t for t in raw_tokens if t.get("token_address") != current_mint],
+        key=lambda t: t.get("create_timestamp") or 0,
+        reverse=True,
+    )
+    histories: list[TokenHistory] = []
+    for t in sorted_tokens[:5]:
+        ath_raw = t.get("token_ath_mc")
+        ts_raw = t.get("create_timestamp")
+        histories.append(TokenHistory(
+            mint=t.get("token_address") or "",
+            name=t.get("symbol") or "—",
+            ath_market_cap=float(ath_raw) if ath_raw else None,
+            create_timestamp=int(ts_raw) if ts_raw else None,
+        ))
+    return histories
+
+
+async def _get_gmgn_dev_tokens(dev_wallet: str, current_mint: str = "") -> list[TokenHistory]:
+    """Fetch tokens created by dev wallet.
+
+    Primary path: direct GMGN OpenAPI HTTP call (~200 ms, zero subprocess overhead).
+    Fallback: gmgn-cli NPX subprocess (used when API key missing or HTTP fails).
+
+    Raises RuntimeError so caller can distinguish fetch failure from empty history.
     """
+    import uuid  # stdlib, no overhead concern
+
+    label = dev_wallet[:8]
+
+    # ------------------------------------------------------------------
+    # Primary: direct HTTP to openapi.gmgn.ai
+    # ------------------------------------------------------------------
+    if _GMGN_API_KEY:
+        try:
+            params = {
+                "chain": "sol",
+                "wallet_address": dev_wallet,
+                "timestamp": int(time.time()),
+                "client_id": str(uuid.uuid4()),
+            }
+            headers = {"X-APIKEY": _GMGN_API_KEY, "Content-Type": "application/json"}
+            t0 = time.perf_counter()
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    _GMGN_BASE_URL,
+                    params=params,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=3.0),
+                ) as resp:
+                    ms = int((time.perf_counter() - t0) * 1000)
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    payload = await resp.json(content_type=None)
+
+            logger.debug(f"[GMGN HTTP] {label}... response in {ms}ms")
+            if payload.get("code") != 0:
+                raise RuntimeError(f"API code={payload.get('code')} msg={payload.get('message')}")
+
+            raw_tokens = (payload.get("data") or {}).get("tokens") or []
+            return _parse_gmgn_tokens(raw_tokens, current_mint)
+
+        except Exception as exc:
+            logger.warning(f"[GMGN HTTP] {label}... failed ({exc}), fallback to CLI")
+
+    # ------------------------------------------------------------------
+    # Fallback: gmgn-cli subprocess
+    # ------------------------------------------------------------------
     loop = asyncio.get_event_loop()
     try:
         result = await asyncio.wait_for(
@@ -460,27 +529,7 @@ async def _get_gmgn_dev_tokens(dev_wallet: str, current_mint: str = "") -> list[
     except json.JSONDecodeError as e:
         raise RuntimeError(f"gmgn-cli invalid JSON: {e}") from e
 
-    # Sort descending by create_timestamp: newest first, oldest last.
-    # Ensures the 5 most recent previous tokens are shown regardless of where
-    # the current token sits in GMGN's list.
-    sorted_tokens = sorted(
-        [t for t in data.get("tokens", []) if t.get("token_address") != current_mint],
-        key=lambda t: t.get("create_timestamp") or 0,
-        reverse=True,
-    )
-    selected = sorted_tokens[:5]
-
-    histories: list[TokenHistory] = []
-    for t in selected:
-        ath_raw = t.get("token_ath_mc")
-        ts_raw = t.get("create_timestamp")
-        histories.append(TokenHistory(
-            mint=t.get("token_address") or "",
-            name=t.get("symbol") or "—",
-            ath_market_cap=float(ath_raw) if ath_raw else None,
-            create_timestamp=int(ts_raw) if ts_raw else None,
-        ))
-    return histories
+    return _parse_gmgn_tokens(data.get("tokens", []), current_mint)
 
 
 # ---------------------------------------------------------------------------
