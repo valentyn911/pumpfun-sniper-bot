@@ -239,27 +239,23 @@ async def _fetch_bc_dev_buy(bc_address: str, rpc: str) -> float | None:
 # ---------------------------------------------------------------------------
 
 _sol_price_usd: float = 0.0
-_sol_price_last_updated: float = 0.0
 
 
-async def _get_sol_price_usd() -> float:
-    """Return SOL/USD price, refreshed at most once per 60 s from Binance."""
-    global _sol_price_usd, _sol_price_last_updated
-    now = time.time()
-    if now - _sol_price_last_updated < 60 and _sol_price_usd > 0:
-        return _sol_price_usd
-    try:
-        timeout = aiohttp.ClientTimeout(total=3.0)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get(
-                "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT"
-            ) as r:
-                data = await r.json()
-                _sol_price_usd = float(data["price"])
-                _sol_price_last_updated = now
-                return _sol_price_usd
-    except Exception:
-        return _sol_price_usd if _sol_price_usd > 0 else 150.0
+async def _sol_price_updater() -> None:
+    """Background task: refresh SOL/USD from Binance every 30 s."""
+    global _sol_price_usd
+    while True:
+        try:
+            timeout = aiohttp.ClientTimeout(total=3.0)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(
+                    "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT"
+                ) as r:
+                    data = await r.json()
+                    _sol_price_usd = float(data["price"])
+        except Exception:
+            pass
+        await asyncio.sleep(30)
 
 
 async def _get_current_token_price_sol(bc_address: str, rpc: str) -> float | None:
@@ -307,11 +303,12 @@ async def _check_entry_mc(
         return True, ""
     if not bc_address or not rpc:
         return True, ""
+    if _sol_price_usd <= 0:
+        return True, ""
     cur_price_sol = await _get_current_token_price_sol(bc_address, rpc)
     if cur_price_sol is None or cur_price_sol <= 0:
         return True, ""
-    sol_usd = await _get_sol_price_usd()
-    cur_mc_usd = cur_price_sol * 1_000_000_000 * sol_usd
+    cur_mc_usd = cur_price_sol * 1_000_000_000 * _sol_price_usd
     if min_mc > 0 and cur_mc_usd < min_mc:
         logger.info(
             f"[MC filter] {token_label}: MC=${cur_mc_usd:.0f} < min=${min_mc:.0f} → skip"
@@ -745,6 +742,7 @@ async def run_scanner(config_path: str) -> None:
                 logger.debug(f"[dedup] Removed {len(stale)} stale mint(s)")
 
     asyncio.create_task(_cleanup_processed_mints())
+    asyncio.create_task(_sol_price_updater())
 
     async def on_new_token(token_info: TokenInfo) -> None:
         nonlocal token_count
