@@ -317,3 +317,67 @@ Full details in `CLAUDE.md`. Key gotchas:
 - Cashback detection: byte 82 of BC account data, or `is_cashback_coin` on `TokenInfo`
 - BondingCurve account = 83 bytes; trailing bytes: `is_mayhem_mode`, `is_cashback_coin`
 - `extreme_fast_mode` skips RPC fetch — event parser must populate `is_mayhem_mode` and `is_cashback_coin` from `CreateEvent`
+
+---
+
+## Session Update — 2026-05-22
+
+### Completed This Session
+
+- `accountSubscribe` WebSocket price monitoring (50–200 ms latency, zero polling)
+- All filter checks run in parallel via `asyncio.gather` (single flat gather, no nested wrappers)
+- Mayhem tokens: silent skip, no Telegram message
+- GMGN failure: token rejected, not passed through
+- Deduplication: 30-min window via `processed_mints` dict
+- Two Telegram message formats: short (failed + reason) and full (passed all filters)
+- ATH filter toggle: "any 1 of 5" vs "all 5" (`ath_require_all`)
+- Two-phase parallel fetch: GMGN + Helius start at **mint time** (not after dev buy arrives); dev buy check runs last after other filters pass (`task_bc_buy` as background `asyncio.Task`)
+- `dev_buy_check_enabled` toggle in dashboard Entry Filters — when OFF: dev buy shown in alert but not enforced as filter
+- TX count range filter (Filter 5): min/max tx count for dev's last 5 tokens, `tx_count_require_all` toggle
+- Token lifetime filter (Filter 6): min lifetime in minutes for dev's last 5 tokens, `lifetime_require_all` toggle
+- Both new filters use Helius `getSignaturesForAddress` (5 parallel calls, ~150 ms, chained after GMGN)
+- Trailing stop reworked: trail% now measured from **activation price** (not entry); supports up to 3 independent trailing stops in `trailing_stops` array; each tracks its own `peak` starting from activation
+- Dashboard: trailing stops replaced with multi-row list (+ Add button, up to 3); per-row hint shows calculated initial floor % from entry
+- `bot_config.json`: `trailing_stop` single object → `trailing_stops` array; backward compat kept in monitor
+- GitHub repo created: https://github.com/valentyn911/pumpfun-sniper-bot
+
+### Open Tasks (next session)
+
+1. **Geyser listener** — fully implemented code-wise; needs non-empty `GEYSER_ENDPOINT` and `GEYSER_API_TOKEN` in `.env`, then switch `listener_type: geyser` in bot YAML for ~100 ms detection vs ~300 ms PumpPortal
+
+2. **Sniper wallet analysis** — write `wallet_analysis.py` using Helius RPC for wallet `3ixtZXbbJjNEq89GbeFu8vJMGDMNSePofNEf5kecVhsA`:
+   - Always buys 1.27 SOL at MC ~$2.85–3.05K (pump.fun launch)
+   - Gets 35.8M or 38M tokens
+   - Exit: 2–6 sells, largest portion first at lowest TP
+   - Losses: always 2×50% sells, SL ~-8% on second half
+   - Winners: progressive ladder, trailing stop fires last ~13% on pullback
+   - Script should parse Helius transaction history and reconstruct entry/exit logic
+
+3. **`HELIUS_GATEKEEPER_URL`** — added to `.env.example`; obtain from Helius dashboard and populate `.env` for gated RPC access
+
+### Architecture Notes (current state)
+
+**Token processing flow (as implemented):**
+```
+Token minted → dev address known
+│
+├── task_bc_buy  (asyncio.Task, fires immediately)
+├── task_mint    (asyncio.Task, fires immediately)
+│
+└── Phase 1 await (4 s timeout):
+    ├── check_dev_wallet()        ~300 ms
+    └── _get_gmgn_dev_tokens()   ~1.3 s  ← bottleneck
+        └── Stream 4: getSignaturesForAddress ×5  ~150 ms (after GMGN)
+│
+Data guards → Filter 3 (ATH) → Filter 4 (Mig) → Filter 5 (TX) → Filter 6 (Lifetime)
+│
+└── Phase 2: await task_bc_buy (0.5 s cap, usually instant)
+    └── Filter 2 (dev buy) — last, only if dev_buy_check_enabled=true
+        └── ✅ ALL PASSED → Telegram + optional auto-buy
+```
+
+**Trailing stop formula (corrected):**
+- Activation price = `entry × (1 + activation_pct/100)`
+- At activation: `state["peak"] = current_price`
+- Fire when: `current_price ≤ state["peak"] × (1 − trail_size_pct/100)`
+- Initial floor: `activation_price × (1 − trail_size_pct/100)` = `entry × (1+act/100) × (1−trail/100)`

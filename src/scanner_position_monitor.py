@@ -140,9 +140,9 @@ async def monitor_position(
     remaining: float = token_amount
     tp_fired: set[int] = set()   # original indices of fired TP levels
     sl_fired: set[int] = set()   # original indices of fired SL levels
-    trail_fired: bool = False
-    trail_active: bool = False
-    peak_price: float = entry_price
+    # Per-trailing-stop state dicts: {active, peak, fired}
+    # Lazily extended so new stops added to config start tracking immediately.
+    trail_states: list[dict] = []
 
     async def _sell(amount: float, reason: str, current_price: float) -> bool:
         """Execute a partial sell, decrement remaining, return True on success."""
@@ -214,11 +214,6 @@ async def monitor_position(
 
     async def _on_price(current_price: float) -> None:
         """Run TP/SL/trailing-stop checks for the given price tick."""
-        nonlocal peak_price, trail_active, trail_fired
-
-        if current_price > peak_price:
-            peak_price = current_price
-
         price_chg_pct = ((current_price - entry_price) / entry_price) * 100
 
         cfg = read_config() or {}
@@ -226,7 +221,17 @@ async def monitor_position(
         preset = (cfg.get("presets") or {}).get(active_pid, {})
         tp_levels: list[dict] = preset.get("take_profits", [])
         sl_levels: list[dict] = preset.get("stop_losses", [])
-        trail_cfg: dict = preset.get("trailing_stop", {})
+
+        # Support trailing_stops array (new) and trailing_stop single object (legacy)
+        ts_list: list[dict] = list(preset.get("trailing_stops") or [])
+        if not ts_list:
+            legacy = preset.get("trailing_stop", {})
+            if legacy.get("enabled"):
+                ts_list = [legacy]
+
+        # Lazily extend trail_states for any new stops added to config
+        while len(trail_states) < len(ts_list):
+            trail_states.append({"active": False, "peak": entry_price, "fired": False})
 
         # --- Stop-loss (ascending price_pct → least loss fires first) ---
         for orig_idx, level in sorted(
@@ -268,29 +273,40 @@ async def monitor_position(
         if remaining <= _DUST_TOKENS:
             return
 
-        # --- Trailing stop ---
-        if trail_cfg.get("enabled") and not trail_fired:
-            act_pct = float(trail_cfg.get("activation_pct", 50))
-            trail_size = float(trail_cfg.get("trail_size_pct", 20))
-            trail_pos = float(trail_cfg.get("position_pct", 100))
+        # --- Trailing stops (each independent; peak tracks from activation price) ---
+        for i, ts_cfg in enumerate(ts_list):
+            if not ts_cfg.get("enabled", True):
+                continue
+            state = trail_states[i]
+            if state["fired"]:
+                continue
 
-            if not trail_active and price_chg_pct >= act_pct:
-                trail_active = True
+            act_pct = float(ts_cfg.get("activation_pct", 50))
+            trail_size = float(ts_cfg.get("trail_size_pct", 20))
+            trail_pos = float(ts_cfg.get("position_pct", 100))
+
+            if not state["active"] and price_chg_pct >= act_pct:
+                state["active"] = True
+                state["peak"] = current_price  # start tracking peak from activation price
                 logger.info(
-                    f"[monitor] {label} trailing stop ACTIVATED | "
+                    f"[monitor] {label} trail[{i + 1}] ACTIVATED | "
+                    f"activation=+{act_pct:.1f}% | floor={current_price * (1 - trail_size / 100):.8f} | "
                     f"price={current_price:.8f} ({price_chg_pct:+.1f}%)"
                 )
 
-            if trail_active:
-                trail_trigger = peak_price * (1 - trail_size / 100)
+            if state["active"]:
+                if current_price > state["peak"]:
+                    state["peak"] = current_price
+                trail_trigger = state["peak"] * (1 - trail_size / 100)
                 if current_price <= trail_trigger:
-                    trail_fired = True
+                    state["fired"] = True
                     await _sell(
                         remaining * (trail_pos / 100),
-                        f"Trail(peak={peak_price:.8f} -{trail_size:.1f}% "
+                        f"Trail{i + 1}(peak={state['peak']:.8f} -{trail_size:.1f}% "
                         f"price={current_price:.8f})",
                         current_price,
                     )
+                    return
 
     # ---------------------------------------------------------------------------
     # accountSubscribe WebSocket loop

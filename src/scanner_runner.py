@@ -755,47 +755,44 @@ async def run_scanner(config_path: str) -> None:
         )
 
         # -------------------------------------------------------------------
-        # Parallel data fetch — single asyncio.gather for all four streams
+        # Data fetch — all four tasks fire immediately in parallel at mint time.
+        # Phase 1: GMGN + dev wallet (gates filters 3-6, ~1.3 s typical).
+        # Phase 2: dev buy collected LAST after other filters pass — the RPC
+        #   call runs during Phase1+filters so it's usually already done.
+        # Net result: total latency = max(GMGN, dev_buy) → not GMGN + dev_buy.
         # -------------------------------------------------------------------
+        t_fetch = time.perf_counter()
+        task_bc_buy: asyncio.Task = asyncio.create_task(
+            _fetch_bc_dev_buy(bc_str, rpc) if (bc_str and rpc)
+            else asyncio.sleep(0, result=None),
+        )
+        task_mint: asyncio.Task = asyncio.create_task(
+            _check_mint_freeze(mint_str, rpc) if rpc
+            else asyncio.sleep(0, result=(False, False)),
+        )
+
         dev = DevWalletInfo(address=creator_str, timed_out=True)
         dev_buy_sol: float | None = None
+        has_mint = has_freeze = False
         histories: list[TokenHistory] = []
         gmgn_failed = False
         sig_data: dict[str, tuple[int, int | None]] = {}
+        phase1_ok = False
 
         try:
-            bc_buy_r, mint_r, dev_r, gmgn_r = await asyncio.wait_for(
+            # Phase 1: GMGN + dev wallet run concurrently; task_bc_buy fires in background.
+            dev_r, gmgn_r = await asyncio.wait_for(
                 asyncio.gather(
-                    _fetch_bc_dev_buy(bc_str, rpc) if (bc_str and rpc) else asyncio.sleep(0, result=None),
-                    _check_mint_freeze(mint_str, rpc) if rpc else asyncio.sleep(0, result=(False, False)),
-                    check_dev_wallet(creator_str, rpc) if (creator_str and rpc) else asyncio.sleep(0, result=DevWalletInfo(address=creator_str or "")),
-                    _get_gmgn_dev_tokens(creator_str, current_mint=mint_str) if creator_str else asyncio.sleep(0, result=[]),
+                    check_dev_wallet(creator_str, rpc) if (creator_str and rpc)
+                    else asyncio.sleep(0, result=DevWalletInfo(address=creator_str or "")),
+                    _get_gmgn_dev_tokens(creator_str, current_mint=mint_str) if creator_str
+                    else asyncio.sleep(0, result=[]),
                     return_exceptions=True,
                 ),
                 timeout=4.0,
             )
+            phase1_ok = True
 
-            # BC dev buy
-            if isinstance(bc_buy_r, Exception):
-                logger.warning(
-                    f"[#{count}] DEV BUY fetch failed for {(bc_str or '')[:8]}: {bc_buy_r}"
-                )
-                dev_buy_sol = None
-            elif bc_buy_r is None and bc_str:
-                logger.warning(
-                    f"[#{count}] DEV BUY returned None for {bc_str[:8]} "
-                    "(account not found or data too short)"
-                )
-                dev_buy_sol = None
-            else:
-                dev_buy_sol = bc_buy_r if isinstance(bc_buy_r, (int, float)) else None
-
-            # Mint/freeze (informational only)
-            has_mint = has_freeze = False
-            if isinstance(mint_r, tuple):
-                has_mint, has_freeze = mint_r
-
-            # Dev wallet
             dev = (
                 dev_r if isinstance(dev_r, DevWalletInfo)
                 else DevWalletInfo(address=creator_str or "")
@@ -803,7 +800,6 @@ async def run_scanner(config_path: str) -> None:
             if isinstance(dev_r, Exception):
                 logger.warning(f"[#{count}] Dev wallet check failed: {dev_r}")
 
-            # GMGN
             gmgn_failed = isinstance(gmgn_r, Exception)
             if gmgn_failed:
                 logger.warning(f"[#{count}] GMGN fetch failed for {mint_str[:8]}: {gmgn_r}")
@@ -811,14 +807,13 @@ async def run_scanner(config_path: str) -> None:
             else:
                 histories = gmgn_r if isinstance(gmgn_r, list) else []
 
-            buy_str = f"{dev_buy_sol:.3f} SOL" if dev_buy_sol is not None else "—"
             logger.info(
-                f"[#{count}] Streams 1-3 (buy={buy_str} mint={has_mint} freeze={has_freeze})"
+                f"[#{count}] Phase1 (dev+GMGN): {(time.perf_counter()-t_fetch)*1000:.0f}ms"
                 f" | GMGN: {len(histories)} tokens"
                 f"{' [GMGN FAILED]' if gmgn_failed else ''}"
             )
 
-            # Stream 4: BC signatures — runs after GMGN result is available, own 1.5 s budget
+            # Stream 4: BC signatures — sequential after GMGN, own 1.5 s timeout
             if _need_sigs and histories and rpc:
                 t_sig = time.perf_counter()
                 try:
@@ -834,12 +829,15 @@ async def run_scanner(config_path: str) -> None:
                 )
 
         except TimeoutError:
-            logger.warning(f"[#{count}] Overall fetch timeout (4s) — sending with dashes")
+            logger.warning(f"[#{count}] Phase1 timeout (4s) — sending with dashes")
+            task_bc_buy.cancel()
+            task_mint.cancel()
         except Exception as e:
-            logger.error(f"[#{count}] Fetch error: {e}")
+            logger.error(f"[#{count}] Phase1 fetch error: {e}")
+            task_bc_buy.cancel()
+            task_mint.cancel()
 
-        t_elapsed = (time.perf_counter() - t_total) * 1000
-        logger.info(f"[#{count}] Total: {t_elapsed:.0f}ms | dev_buy={dev_buy_sol}")
+        logger.info(f"[#{count}] Phase1+sigs: {(time.perf_counter()-t_total)*1000:.0f}ms")
 
         # Read live bot_config for per-token decisions
         bot_cfg = _read_bot_config()
@@ -874,19 +872,6 @@ async def run_scanner(config_path: str) -> None:
         if dev_data_missing or dev.error:
             logger.info(f"[#{count}] Dev wallet data missing — rejecting")
             await tg.send_message(_reject("dev data unavailable"))
-            return
-
-        # -------------------------------------------------------------------
-        # FILTER 2: Dev buy amount
-        # -------------------------------------------------------------------
-        min_dev_buy = float(filt.get("min_dev_buy_sol", 0.1))
-        if dev_buy_sol is not None and dev_buy_sol < min_dev_buy:
-            logger.info(
-                f"[#{count}] Filter: dev bought {dev_buy_sol:.3f} SOL < {min_dev_buy} → skip"
-            )
-            await tg.send_message(_reject(
-                f"Dev buy {dev_buy_sol:.3f} SOL (min {min_dev_buy:.3f} SOL)"
-            ))
             return
 
         min_ath = float(filt.get("min_ath_last5", 0))
@@ -1027,6 +1012,60 @@ async def run_scanner(config_path: str) -> None:
                         f"Token lifetimes {lt_strs} min (min {min_lifetime:.1f} min), none passed"
                     ))
                     return
+
+        # -------------------------------------------------------------------
+        # Phase 2: collect dev buy result (task fired at token detection).
+        # By the time we reach here, GMGN + filters have taken ~1.3 s, so
+        # the dev buy RPC call is usually already complete — await is instant.
+        # -------------------------------------------------------------------
+        if phase1_ok and not task_bc_buy.cancelled():
+            t_bc = time.perf_counter()
+            try:
+                bc_result = await asyncio.wait_for(task_bc_buy, timeout=0.5)
+                if isinstance(bc_result, (int, float)):
+                    dev_buy_sol = bc_result
+                elif bc_result is None and bc_str:
+                    logger.debug(f"[#{count}] DEV BUY returned None for {bc_str[:8]}")
+            except TimeoutError:
+                logger.warning(f"[#{count}] Dev buy still pending after filters — treating as None")
+            except Exception as exc:
+                logger.warning(f"[#{count}] DEV BUY fetch failed for {(bc_str or '')[:8]}: {exc}")
+            buy_str = f"{dev_buy_sol:.3f} SOL" if dev_buy_sol is not None else "—"
+            logger.info(
+                f"[#{count}] Phase2 (dev buy={buy_str}): "
+                f"{(time.perf_counter()-t_bc)*1000:.0f}ms"
+            )
+
+        # Collect mint/freeze — informational, non-blocking
+        if not task_mint.cancelled():
+            if task_mint.done():
+                try:
+                    mint_r = task_mint.result()
+                    if isinstance(mint_r, tuple):
+                        has_mint, has_freeze = mint_r
+                        if has_mint or has_freeze:
+                            logger.info(f"[#{count}] Mint auth={has_mint}, Freeze auth={has_freeze}")
+                except Exception:
+                    pass
+            else:
+                task_mint.cancel()
+
+        logger.info(f"[#{count}] Total: {(time.perf_counter()-t_total)*1000:.0f}ms | dev_buy={dev_buy_sol}")
+
+        # -------------------------------------------------------------------
+        # FILTER 2 (last): Dev buy amount
+        # dev_buy_check_enabled=False → dev buy shown in alert, filter skipped
+        # -------------------------------------------------------------------
+        if filt.get("dev_buy_check_enabled", True):
+            min_dev_buy = float(filt.get("min_dev_buy_sol", 0.1))
+            if dev_buy_sol is not None and dev_buy_sol < min_dev_buy:
+                logger.info(
+                    f"[#{count}] Filter: dev bought {dev_buy_sol:.3f} SOL < {min_dev_buy} → skip"
+                )
+                await tg.send_message(_reject(
+                    f"Dev buy {dev_buy_sol:.3f} SOL (min {min_dev_buy:.3f} SOL)"
+                ))
+                return
 
         # -------------------------------------------------------------------
         # ALL FILTERS PASSED

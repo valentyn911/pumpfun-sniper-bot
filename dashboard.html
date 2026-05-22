@@ -371,7 +371,7 @@ function buildPresetUI(n) {
   buildEntryCol(n, p);
   buildFiltersCol(n, p);
   buildTpSl(n, p);
-  updateTrailingHint(n);  // populate hint with initial values
+  updateAllTrailHints(n);
 }
 
 function buildEntryCol(n, p) {
@@ -395,12 +395,21 @@ function buildEntryCol(n, p) {
 
 function buildFiltersCol(n, p) {
   const f = p.filters || {};
-  const ts = p.trailing_stop || {};
   const el = document.getElementById(`filters-col-${n}`);
   el.innerHTML = `
 <h3>Entry Filters</h3>
-<label>Min Dev Buy (SOL)</label>
-<input type="number" id="p${n}_min_dev_buy" value="${f.min_dev_buy_sol ?? 0.1}" min="0" step="0.01">
+<div class="toggle-row" style="margin-top:2px;margin-bottom:4px">
+  <label style="margin:0">Min Dev Buy (SOL)</label>
+  <div style="display:flex;align-items:center;gap:8px">
+    <span class="toggle-label" style="font-size:11px">Dev Buy Check</span>
+    <label class="toggle">
+      <input type="checkbox" id="p${n}_dev_buy_check" ${f.dev_buy_check_enabled !== false ? 'checked' : ''} onchange="onDevBuyCheckToggle(${n})">
+      <span class="slider"></span>
+    </label>
+  </div>
+</div>
+<input type="number" id="p${n}_min_dev_buy" value="${f.min_dev_buy_sol ?? 0.1}" min="0" step="0.01"${f.dev_buy_check_enabled === false ? ' disabled style="opacity:0.4"' : ''}>
+<div id="p${n}_dev_buy_hint" class="field-hint" style="display:${f.dev_buy_check_enabled === false ? 'block' : 'none'};color:#f59e0b">⚡ Faster entry — dev buy not required</div>
 <label>Min ATH of last 5 tokens ($)</label>
 <input type="number" id="p${n}_min_ath" value="${f.min_ath_last5 ?? 0}" min="0">
 <div class="toggle-row" style="margin-top:6px;margin-bottom:2px">
@@ -439,37 +448,13 @@ function buildFiltersCol(n, p) {
   </label>
 </div>
 
-<h3>Trailing Stop</h3>
-<div class="toggle-row" style="margin-top:0;margin-bottom:8px">
-  <span class="toggle-label">Enabled</span>
-  <label class="toggle">
-    <input type="checkbox" id="p${n}_ts_enabled" ${ts.enabled ? 'checked' : ''} onchange="onTrailingToggle(${n})">
-    <span class="slider"></span>
-  </label>
-</div>
-<div id="p${n}_ts_fields" style="display:${ts.enabled ? 'block' : 'none'}">
-  <div class="trail-grid">
-    <div>
-      <label>Activation (+%)</label>
-      <input type="number" id="p${n}_ts_activation" value="${ts.activation_pct ?? 30}" min="0" placeholder="%" oninput="updateTrailingHint(${n})">
-    </div>
-    <div>
-      <label>Trail Size (%)</label>
-      <input type="number" id="p${n}_ts_trail" value="${ts.trail_size_pct ?? 20}" min="0" placeholder="%" oninput="updateTrailingHint(${n})">
-    </div>
-    <div>
-      <label>Position Size (%)</label>
-      <input type="number" id="p${n}_ts_position" value="${ts.position_pct ?? 50}" min="0" max="100" placeholder="%" oninput="updateTrailingHint(${n})">
-    </div>
-  </div>
-  <div class="field-hint" id="p${n}_ts_hint" style="margin-top:6px"></div>
-</div>
+<h3>Trailing Stops <span style="color:var(--muted);font-weight:400">(up to 3)</span></h3>
+<div id="trail-rows-${n}">${(()=>{
+  const tsList = p.trailing_stops || (p.trailing_stop ? [p.trailing_stop] : []);
+  return tsList.map((ts,i) => makeTrailRow(n,i,ts.activation_pct,ts.trail_size_pct,ts.position_pct,ts.enabled!==false)).join('');
+})()}</div>
+<button class="btn btn-ghost add-btn" onclick="addTrailRow(${n})" style="margin-top:6px">+ Add Trailing Stop</button>
 `;
-}
-
-function onTrailingToggle(n) {
-  const en = document.getElementById(`p${n}_ts_enabled`).checked;
-  document.getElementById(`p${n}_ts_fields`).style.display = en ? 'block' : 'none';
 }
 
 function onAthModeToggle(n) {
@@ -487,16 +472,78 @@ function onLifetimeModeToggle(n) {
   document.getElementById(`p${n}_lt_mode_lbl`).textContent = on ? 'Every token' : 'Any 1 of 5';
 }
 
-function updateTrailingHint(n) {
-  const act  = parseFloat(document.getElementById(`p${n}_ts_activation`)?.value) || 0;
-  const trail = parseFloat(document.getElementById(`p${n}_ts_trail`)?.value) || 0;
-  const pos  = parseFloat(document.getElementById(`p${n}_ts_position`)?.value) || 0;
-  const el = document.getElementById(`p${n}_ts_hint`);
+function onDevBuyCheckToggle(n) {
+  const enabled = document.getElementById(`p${n}_dev_buy_check`).checked;
+  const inp = document.getElementById(`p${n}_min_dev_buy`);
+  inp.disabled = !enabled;
+  inp.style.opacity = enabled ? '1' : '0.4';
+  document.getElementById(`p${n}_dev_buy_hint`).style.display = enabled ? 'none' : 'block';
+}
+
+function makeTrailRow(n, i, act, trail, pos, enabled) {
+  act = act ?? 40; trail = trail ?? 25; pos = pos ?? 100;
+  enabled = enabled !== false;
+  return `<div class="trail-row" id="trail-row-${n}-${i}" style="margin-bottom:10px">
+  <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap">
+    <label class="toggle" style="flex-shrink:0;margin:0" title="Enable this stop">
+      <input type="checkbox" id="trail-en-${n}-${i}" ${enabled?'checked':''}>
+      <span class="slider"></span>
+    </label>
+    <div style="display:flex;align-items:center;gap:3px">
+      <span class="row-label" style="color:var(--green)">+</span>
+      <input type="number" id="trail-act-${n}-${i}" value="${act}" min="0" step="1" placeholder="%" style="width:52px" title="Activation from entry +%" oninput="updateTrailHint(${n},${i})">
+      <span class="row-label" style="font-size:10px">act%</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:3px">
+      <span class="row-label" style="color:var(--red)">-</span>
+      <input type="number" id="trail-trail-${n}-${i}" value="${trail}" min="0" step="1" placeholder="%" style="width:52px" title="Trail drop from activation -%" oninput="updateTrailHint(${n},${i})">
+      <span class="row-label" style="font-size:10px">trail%</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:3px">
+      <input type="number" id="trail-pos-${n}-${i}" value="${pos}" min="1" max="100" step="1" placeholder="%" style="width:52px" title="Position %" oninput="updateTrailHint(${n},${i})">
+      <span class="row-label" style="font-size:10px">% pos</span>
+    </div>
+    <button class="remove-btn" onclick="removeTrailRow(${n},${i})" title="Remove">×</button>
+  </div>
+  <div class="field-hint" id="trail-hint-${n}-${i}" style="margin-top:4px;padding-left:32px"></div>
+</div>`;
+}
+
+function updateTrailHint(n, i) {
+  const act   = parseFloat(document.getElementById(`trail-act-${n}-${i}`)?.value)   || 0;
+  const trail = parseFloat(document.getElementById(`trail-trail-${n}-${i}`)?.value) || 0;
+  const pos   = parseFloat(document.getElementById(`trail-pos-${n}-${i}`)?.value)   || 0;
+  const el = document.getElementById(`trail-hint-${n}-${i}`);
   if (!el) return;
+  const floorPct = ((1 + act / 100) * (1 - trail / 100) - 1) * 100;
+  const floorStr = floorPct >= 0 ? `+${floorPct.toFixed(1)}` : floorPct.toFixed(1);
   el.innerHTML =
-    `Activates when price rises <b>+${act}%</b> from entry. ` +
-    `Stop trails at <b>${trail}%</b> below entry price. ` +
-    `Closes <b>${pos}%</b> of remaining position.`;
+    `Activates at <b>+${act}%</b> from entry. ` +
+    `Trails <b>-${trail}%</b> below activation price. ` +
+    `Closes <b>${pos}%</b> of position. ` +
+    `Initial floor: <b>${floorStr}%</b> from entry.`;
+}
+
+function updateAllTrailHints(n) {
+  const c = document.getElementById(`trail-rows-${n}`);
+  if (!c) return;
+  c.querySelectorAll('.trail-row').forEach(row => {
+    const i = row.id.split('-').slice(-1)[0];
+    updateTrailHint(n, i);
+  });
+}
+
+function addTrailRow(n) {
+  const c = document.getElementById(`trail-rows-${n}`);
+  if (c.querySelectorAll('.trail-row').length >= 3) { toast('Max 3 trailing stops', true); return; }
+  const i = Date.now();
+  c.insertAdjacentHTML('beforeend', makeTrailRow(n, i, 40, 25, 100, true));
+  updateTrailHint(n, i);
+}
+
+function removeTrailRow(n, i) {
+  const el = document.getElementById(`trail-row-${n}-${i}`);
+  if (el) el.remove();
 }
 
 function buildTpSl(n, p) {
@@ -642,14 +689,23 @@ function readPreset(n) {
     max_retries: Math.max(1, v(`p${n}_max_retries`)),
     take_profits: tps,
     stop_losses: sls,
-    trailing_stop: {
-      enabled: checked(`p${n}_ts_enabled`),
-      activation_pct: v(`p${n}_ts_activation`),
-      trail_size_pct: v(`p${n}_ts_trail`),
-      position_pct: v(`p${n}_ts_position`),
-    },
+    trailing_stops: (() => {
+      const c = document.getElementById(`trail-rows-${n}`);
+      const stops = [];
+      if (c) c.querySelectorAll('.trail-row').forEach(row => {
+        const i = row.id.split('-').slice(-1)[0];
+        const act   = parseFloat(document.getElementById(`trail-act-${n}-${i}`)?.value);
+        const trail = parseFloat(document.getElementById(`trail-trail-${n}-${i}`)?.value);
+        const pos   = parseFloat(document.getElementById(`trail-pos-${n}-${i}`)?.value);
+        const en    = document.getElementById(`trail-en-${n}-${i}`)?.checked ?? true;
+        if (!isNaN(act) && !isNaN(trail) && !isNaN(pos))
+          stops.push({ enabled: en, activation_pct: act, trail_size_pct: trail, position_pct: pos });
+      });
+      return stops;
+    })(),
     filters: {
       min_dev_buy_sol: v(`p${n}_min_dev_buy`),
+      dev_buy_check_enabled: checked(`p${n}_dev_buy_check`),
       min_ath_last5: v(`p${n}_min_ath`),
       ath_require_all: checked(`p${n}_ath_require_all`),
       min_migrations_last5: Math.round(v(`p${n}_min_mig`)),
