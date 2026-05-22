@@ -35,10 +35,13 @@ try:
 except ImportError:
     pass
 
+from solders.pubkey import Pubkey
+
 from core.client import SolanaClient
 from core.priority_fee.manager import PriorityFeeManager
 from core.wallet import Wallet
 from interfaces.core import Platform, TokenInfo
+from platforms.pumpfun.address_provider import PumpFunAddresses
 from monitoring.dev_checker import DevWalletInfo, check_dev_wallet
 from monitoring.listener_factory import ListenerFactory
 from notifications.telegram_reporter import TelegramReporter
@@ -93,6 +96,7 @@ class TokenHistory:
     mint: str
     name: str
     ath_market_cap: float | None = None
+    create_timestamp: int | None = None
 
     @property
     def migrated(self) -> bool | None:
@@ -263,6 +267,66 @@ async def _check_mint_freeze(mint_str: str, rpc: str) -> tuple[bool, bool]:
 
 
 # ---------------------------------------------------------------------------
+# Helius BC signatures batch (Stream 4)
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_signatures_for_bc(bc_address: str, rpc: str) -> tuple[int, int | None]:
+    """Fetch tx count and last blockTime for one bonding-curve address.
+
+    Uses limit=1000 — count is capped but sufficient to distinguish rugs (5–50)
+    from real tokens (100+).  Returns (tx_count, last_blocktime_unix).
+    last_blocktime is signatures[0].blockTime — i.e. the *most recent* trade.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSignaturesForAddress",
+        "params": [bc_address, {"limit": 1000, "commitment": "confirmed"}],
+    }
+    timeout = aiohttp.ClientTimeout(total=2.0)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(rpc, json=payload) as resp:
+                data = await resp.json()
+        sigs = data.get("result") or []
+        last_blocktime: int | None = sigs[0].get("blockTime") if sigs else None
+        return len(sigs), last_blocktime
+    except Exception as exc:
+        logger.debug(f"[sigs] fetch failed for {bc_address[:8]}: {exc}")
+        return 0, None
+
+
+async def _fetch_token_signatures_batch(
+    histories: list[TokenHistory],
+    rpc: str,
+) -> dict[str, tuple[int, int | None]]:
+    """Fetch (tx_count, last_blocktime) for each history token's BC v2 in parallel.
+
+    Derives each bonding-curve-v2 PDA from the mint address.
+    Returns {mint_str: (tx_count, last_blocktime)}.
+    Entries that fail silently return (0, None).
+    """
+
+    async def _one(h: TokenHistory) -> tuple[str, int, int | None]:
+        try:
+            bc_v2 = str(PumpFunAddresses.find_bonding_curve_v2(Pubkey.from_string(h.mint)))
+            tx_count, last_bt = await _fetch_signatures_for_bc(bc_v2, rpc)
+        except Exception as exc:
+            logger.debug(f"[sigs] BC derivation failed for {h.mint[:8]}: {exc}")
+            tx_count, last_bt = 0, None
+        return h.mint, tx_count, last_bt
+
+    raw = await asyncio.gather(*[_one(h) for h in histories], return_exceptions=True)
+    result: dict[str, tuple[int, int | None]] = {}
+    for item in raw:
+        if isinstance(item, tuple):
+            mint, cnt, bt = item
+            result[mint] = (cnt, bt)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # GMGN CLI (Поток 3)
 # ---------------------------------------------------------------------------
 
@@ -315,10 +379,12 @@ async def _get_gmgn_dev_tokens(dev_wallet: str, current_mint: str = "") -> list[
     ]
     for t in raw_tokens[:5]:
         ath_raw = t.get("token_ath_mc")
+        ts_raw = t.get("create_timestamp")
         histories.append(TokenHistory(
             mint=t.get("token_address") or "",
             name=t.get("symbol") or "—",
             ath_market_cap=float(ath_raw) if ath_raw else None,
+            create_timestamp=int(ts_raw) if ts_raw else None,
         ))
     return histories
 
@@ -674,8 +740,23 @@ async def run_scanner(config_path: str) -> None:
                 f"dev_buy will be None (token: {mint_str[:8]})"
             )
 
+        # Pre-read config to decide whether to run the signatures batch (stream 4).
+        # Avoids the fetch entirely when all three new filters are disabled (= 0).
+        _pre_cfg = _read_bot_config() or {}
+        _pre_filt = (
+            (_pre_cfg.get("presets") or {})
+            .get(str(_pre_cfg.get("active_preset", 1)), {})
+            .get("filters", {})
+        )
+        _need_sigs: bool = bool(rpc) and bool(creator_str) and (
+            int(_pre_filt.get("min_tx_count", 0)) > 0
+            or int(_pre_filt.get("max_tx_count", 0)) > 0
+            or float(_pre_filt.get("min_lifetime_minutes", 0)) > 0
+        )
+
         # -------------------------------------------------------------------
         # Parallel data fetch: BC dev buy (stream 1) + dev wallet + GMGN (streams 2+3)
+        # stream 4 (BC signatures) chains inside stream 2+3 right after GMGN returns
         # -------------------------------------------------------------------
         async def _run_stream1_bc() -> float | None:
             """Stream 1: mint/freeze check (silent) + BC dev buy."""
@@ -709,12 +790,15 @@ async def run_scanner(config_path: str) -> None:
             )
             return bc_buy
 
-        async def _run_stream2_then_3() -> tuple[DevWalletInfo, list[TokenHistory], bool]:
-            """Streams 2+3: dev wallet check and GMGN in parallel.
+        async def _run_stream2_then_3() -> tuple[
+            DevWalletInfo, list[TokenHistory], bool, dict[str, tuple[int, int | None]]
+        ]:
+            """Streams 2+3+4: dev wallet + GMGN in parallel, then BC signatures.
 
-            Returns (dev_info, histories, gmgn_failed).
-            gmgn_failed=True means a communication error occurred — the histories
-            list will be empty but that is NOT the same as 'dev has no tokens'.
+            Returns (dev_info, histories, gmgn_failed, sig_data).
+            gmgn_failed=True means a communication error — histories will be empty
+            but that is NOT the same as 'dev has no tokens'.
+            sig_data is populated only when _need_sigs is True and histories is non-empty.
             """
             t0 = time.perf_counter()
 
@@ -757,12 +841,25 @@ async def run_scanner(config_path: str) -> None:
                 f" | GMGN tokens: {len(histories)}"
                 f"{' [GMGN FAILED]' if gmgn_failed else ''}"
             )
-            return dev, histories, gmgn_failed
+
+            # Stream 4: BC signatures batch — starts immediately after GMGN,
+            # still inside the outer 4 s asyncio.wait_for timeout.
+            sig_data: dict[str, tuple[int, int | None]] = {}
+            if _need_sigs and histories and rpc:
+                t_sig = time.perf_counter()
+                sig_data = await _fetch_token_signatures_batch(histories, rpc)
+                logger.info(
+                    f"[#{count}] Stream4 (sigs x{len(sig_data)}): "
+                    f"{(time.perf_counter() - t_sig) * 1000:.0f}ms"
+                )
+
+            return dev, histories, gmgn_failed, sig_data
 
         dev = DevWalletInfo(address=creator_str, timed_out=True)
         dev_buy_sol: float | None = None
         histories: list[TokenHistory] = []
         gmgn_failed = False
+        sig_data: dict[str, tuple[int, int | None]] = {}
 
         try:
             stream1_result, stream23_result = await asyncio.wait_for(
@@ -770,7 +867,7 @@ async def run_scanner(config_path: str) -> None:
                 timeout=4.0,
             )
             dev_buy_sol = stream1_result
-            dev, histories, gmgn_failed = stream23_result
+            dev, histories, gmgn_failed, sig_data = stream23_result
         except TimeoutError:
             logger.warning(f"[#{count}] Overall fetch timeout (4s) — sending with dashes")
         except Exception as e:
@@ -872,6 +969,99 @@ async def run_scanner(config_path: str) -> None:
                     f"Migrations {mig_count}/{len(histories)} (min {min_mig})"
                 ))
                 return
+
+        # -------------------------------------------------------------------
+        # FILTER 5: TX count range for dev's last 5 tokens
+        # min_tx_count=0 → no lower bound; max_tx_count=0 → no upper bound
+        # -------------------------------------------------------------------
+        min_tx = int(filt.get("min_tx_count", 0))
+        max_tx = int(filt.get("max_tx_count", 0))
+        if (min_tx > 0 or max_tx > 0) and sig_data and histories:
+            tx_require_all = bool(filt.get("tx_count_require_all", False))
+
+            def _tx_range_str() -> str:
+                if min_tx > 0 and max_tx > 0:
+                    return f"{min_tx}–{max_tx}"
+                return f">={min_tx}" if min_tx > 0 else f"<={max_tx}"
+
+            def _tx_ok(h: TokenHistory) -> bool:
+                cnt = sig_data.get(h.mint, (0, None))[0]
+                if min_tx > 0 and cnt < min_tx:
+                    return False
+                if max_tx > 0 and cnt > max_tx:
+                    return False
+                return True
+
+            if tx_require_all:
+                failing_tx = [h for h in histories if not _tx_ok(h)]
+                if failing_tx:
+                    h0 = failing_tx[0]
+                    cnt0 = sig_data.get(h0.mint, (0, None))[0]
+                    logger.info(
+                        f"[#{count}] Filter: tx count {cnt0} out of range "
+                        f"{_tx_range_str()} for {h0.name} → skip"
+                    )
+                    await tg.send_message(_reject(
+                        f"TX count {cnt0} (range {_tx_range_str()}) for {h0.name}"
+                    ))
+                    return
+            else:
+                if not any(_tx_ok(h) for h in histories):
+                    counts = [sig_data.get(h.mint, (0, None))[0] for h in histories]
+                    logger.info(
+                        f"[#{count}] Filter: no token in tx range "
+                        f"{_tx_range_str()}, counts={counts} → skip"
+                    )
+                    await tg.send_message(_reject(
+                        f"TX count {counts} (range {_tx_range_str()}), none passed"
+                    ))
+                    return
+
+        # -------------------------------------------------------------------
+        # FILTER 6: Token lifetime in minutes for dev's last 5 tokens
+        # -------------------------------------------------------------------
+        min_lifetime = float(filt.get("min_lifetime_minutes", 0))
+        if min_lifetime > 0 and sig_data and histories:
+            lifetime_require_all = bool(filt.get("lifetime_require_all", False))
+
+            def _lifetime_minutes(h: TokenHistory) -> float | None:
+                last_bt = sig_data.get(h.mint, (0, None))[1]
+                if last_bt is None or h.create_timestamp is None:
+                    return None
+                return (last_bt - h.create_timestamp) / 60.0
+
+            def _lifetime_ok(h: TokenHistory) -> bool:
+                lt = _lifetime_minutes(h)
+                return lt is None or lt >= min_lifetime  # None = no data → don't reject
+
+            if lifetime_require_all:
+                failing_lt = [h for h in histories if not _lifetime_ok(h)]
+                if failing_lt:
+                    h0 = failing_lt[0]
+                    lt0 = _lifetime_minutes(h0)
+                    lt_str = f"{lt0:.1f}" if lt0 is not None else "?"
+                    logger.info(
+                        f"[#{count}] Filter: lifetime {lt_str}min < "
+                        f"{min_lifetime:.1f}min for {h0.name} → skip"
+                    )
+                    await tg.send_message(_reject(
+                        f"Token lifetime {lt_str} min (min {min_lifetime:.1f} min) for {h0.name}"
+                    ))
+                    return
+            else:
+                if not any(_lifetime_ok(h) for h in histories):
+                    lt_strs = [
+                        f"{_lifetime_minutes(h):.1f}" if _lifetime_minutes(h) is not None else "?"
+                        for h in histories
+                    ]
+                    logger.info(
+                        f"[#{count}] Filter: no token with lifetime >= "
+                        f"{min_lifetime:.1f}min, values={lt_strs} → skip"
+                    )
+                    await tg.send_message(_reject(
+                        f"Token lifetimes {lt_strs} min (min {min_lifetime:.1f} min), none passed"
+                    ))
+                    return
 
         # -------------------------------------------------------------------
         # ALL FILTERS PASSED

@@ -413,6 +413,32 @@ function buildFiltersCol(n, p) {
 <label>Min Migrations in last 5 (0–5)</label>
 <input type="number" id="p${n}_min_mig" value="${f.min_migrations_last5 ?? 0}" min="0" max="5">
 
+<label>TX Count — last 5 tokens</label>
+<div style="display:flex;align-items:center;gap:6px">
+  <input type="number" id="p${n}_min_tx" value="${f.min_tx_count ?? 0}" min="0" placeholder="Min" style="width:72px">
+  <span style="font-size:11px;color:var(--muted)">–</span>
+  <input type="number" id="p${n}_max_tx" value="${f.max_tx_count ?? 0}" min="0" placeholder="Max" style="width:72px">
+</div>
+<div class="field-hint">0 = disabled. Rug ≈ 5–50 txs. Real token ≈ 100+.</div>
+<div class="toggle-row" style="margin-top:4px;margin-bottom:2px">
+  <span class="toggle-label" id="p${n}_tx_mode_lbl">${f.tx_count_require_all ? 'Every token' : 'Any 1 of 5'}</span>
+  <label class="toggle">
+    <input type="checkbox" id="p${n}_tx_require_all" ${f.tx_count_require_all ? 'checked' : ''} onchange="onTxModeToggle(${n})">
+    <span class="slider"></span>
+  </label>
+</div>
+
+<label>Min Token Lifetime (minutes)</label>
+<input type="number" id="p${n}_min_lifetime" value="${f.min_lifetime_minutes ?? 0}" min="0" step="0.5">
+<div class="field-hint">0 = disabled. Minutes a token traded before dying.</div>
+<div class="toggle-row" style="margin-top:4px;margin-bottom:2px">
+  <span class="toggle-label" id="p${n}_lt_mode_lbl">${f.lifetime_require_all ? 'Every token' : 'Any 1 of 5'}</span>
+  <label class="toggle">
+    <input type="checkbox" id="p${n}_lt_require_all" ${f.lifetime_require_all ? 'checked' : ''} onchange="onLifetimeModeToggle(${n})">
+    <span class="slider"></span>
+  </label>
+</div>
+
 <h3>Trailing Stop</h3>
 <div class="toggle-row" style="margin-top:0;margin-bottom:8px">
   <span class="toggle-label">Enabled</span>
@@ -449,6 +475,16 @@ function onTrailingToggle(n) {
 function onAthModeToggle(n) {
   const on = document.getElementById(`p${n}_ath_require_all`).checked;
   document.getElementById(`p${n}_ath_mode_lbl`).textContent = on ? 'Every token' : 'Any 1 of 5';
+}
+
+function onTxModeToggle(n) {
+  const on = document.getElementById(`p${n}_tx_require_all`).checked;
+  document.getElementById(`p${n}_tx_mode_lbl`).textContent = on ? 'Every token' : 'Any 1 of 5';
+}
+
+function onLifetimeModeToggle(n) {
+  const on = document.getElementById(`p${n}_lt_require_all`).checked;
+  document.getElementById(`p${n}_lt_mode_lbl`).textContent = on ? 'Every token' : 'Any 1 of 5';
 }
 
 function updateTrailingHint(n) {
@@ -617,6 +653,11 @@ function readPreset(n) {
       min_ath_last5: v(`p${n}_min_ath`),
       ath_require_all: checked(`p${n}_ath_require_all`),
       min_migrations_last5: Math.round(v(`p${n}_min_mig`)),
+      min_tx_count: Math.round(v(`p${n}_min_tx`)),
+      max_tx_count: Math.round(v(`p${n}_max_tx`)),
+      tx_count_require_all: checked(`p${n}_tx_require_all`),
+      min_lifetime_minutes: v(`p${n}_min_lifetime`),
+      lifetime_require_all: checked(`p${n}_lt_require_all`),
     },
   };
 }
