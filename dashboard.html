@@ -382,6 +382,9 @@ function buildEntryCol(n, p) {
 <input type="number" id="p${n}_buy_amount" value="${p.buy_amount_sol ?? 0.01}" min="0" step="0.001">
 <label>Priority Fee (SOL)</label>
 <input type="number" id="p${n}_priority_fee" value="${p.priority_fee_sol ?? 0.001}" min="0" step="0.0001">
+<label>Jito Tip (SOL)</label>
+<input type="number" id="p${n}_jito_tip" value="${p.jito_tip_sol ?? 0.003}" min="0" step="0.0001">
+<div class="field-hint">0.003 = standard | 0.005 = competitive | 0.01 = high congestion</div>
 <label>Gas Fee (SOL)</label>
 <input type="number" id="p${n}_gas_fee" value="${p.gas_fee_sol ?? 0.000005}" min="0" step="0.000001">
 <label>Buy Slippage (%)</label>
@@ -683,6 +686,7 @@ function readPreset(n) {
     name: `Preset ${n}`,
     buy_amount_sol: v(`p${n}_buy_amount`),
     priority_fee_sol: v(`p${n}_priority_fee`),
+    jito_tip_sol: v(`p${n}_jito_tip`),
     gas_fee_sol: v(`p${n}_gas_fee`),
     buy_slippage: v(`p${n}_buy_slippage`),
     sell_slippage: v(`p${n}_sell_slippage`),

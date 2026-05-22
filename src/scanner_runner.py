@@ -1103,6 +1103,8 @@ async def run_scanner(config_path: str) -> None:
                 cur_slippage = float(preset.get("buy_slippage", buy_slippage * 100)) / 100
                 cur_priority_sol = float(preset.get("priority_fee_sol", priority_fee_sol))
                 cur_priority_ul = int(cur_priority_sol * 1_000_000_000)
+                cur_jito_tip_sol = float(preset.get("jito_tip_sol", 0.003))
+                cur_jito_tip_ul = int(cur_jito_tip_sol * 1_000_000_000) if cur_jito_tip_sol > 0 else None
 
                 from core.priority_fee.manager import PriorityFeeManager as _PFM
                 fresh_pf = _PFM(
@@ -1121,6 +1123,7 @@ async def run_scanner(config_path: str) -> None:
                     amount=cur_buy_amount,
                     slippage=cur_slippage,
                     max_retries=int(preset.get("max_retries", 1)),
+                    jito_tip_lamports=cur_jito_tip_ul,
                 )
 
                 await _update_bot_config({"open_positions": open_pos + 1})

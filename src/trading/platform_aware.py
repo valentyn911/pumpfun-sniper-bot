@@ -33,6 +33,7 @@ class PlatformAwareBuyer(Trader):
         extreme_fast_token_amount: int = 0,
         extreme_fast_mode: bool = False,
         compute_units: dict | None = None,
+        jito_tip_lamports: int | None = None,
     ):
         """Initialize platform-aware token buyer."""
         self.client = client
@@ -44,6 +45,7 @@ class PlatformAwareBuyer(Trader):
         self.extreme_fast_mode = extreme_fast_mode
         self.extreme_fast_token_amount = extreme_fast_token_amount
         self.compute_units = compute_units or {}
+        self.jito_tip_lamports = jito_tip_lamports
 
     async def execute(self, token_info: TokenInfo) -> TradeResult:
         """Execute buy operation using platform-specific implementations."""
@@ -187,6 +189,7 @@ class PlatformAwareBuyer(Trader):
                 account_data_size_limit=self._get_cu_override(
                     "account_data_size", token_info.platform
                 ),
+                jito_tip_lamports=self.jito_tip_lamports,
             )
 
             success = await self.client.confirm_transaction(tx_signature)
@@ -322,6 +325,7 @@ class PlatformAwareSeller(Trader):
         slippage: float = 0.25,
         max_retries: int = 5,
         compute_units: dict | None = None,
+        jito_tip_lamports: int | None = None,
     ):
         """Initialize platform-aware token seller."""
         self.client = client
@@ -330,6 +334,7 @@ class PlatformAwareSeller(Trader):
         self.slippage = slippage
         self.max_retries = max_retries
         self.compute_units = compute_units or {}
+        self.jito_tip_lamports = jito_tip_lamports
 
     async def execute(
         self, token_info: TokenInfo, token_amount: float, token_price: float
@@ -468,6 +473,7 @@ class PlatformAwareSeller(Trader):
                 account_data_size_limit=self._get_cu_override(
                     "account_data_size", token_info.platform
                 ),
+                jito_tip_lamports=self.jito_tip_lamports,
             )
 
             success = await self.client.confirm_transaction(tx_signature)

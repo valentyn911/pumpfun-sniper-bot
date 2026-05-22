@@ -17,6 +17,7 @@ from solders.instruction import Instruction
 from solders.keypair import Keypair
 from solders.message import Message
 from solders.pubkey import Pubkey
+from solders.system_program import TransferParams, transfer
 from solders.transaction import Transaction
 
 from core.rpc_rate_limiter import TokenBucketRateLimiter
@@ -25,6 +26,18 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 HTTP_TOO_MANY_REQUESTS = 429
+
+# Official Jito tip accounts (8 addresses, one picked randomly per transaction)
+_JITO_TIP_ACCOUNTS: list[str] = [
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+    "HFqU5x63VTqvMXZMGUK4TqFNDLNcfEnQPZvDkVZjpRWQ",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+    "ADaUMid9gy3sNBYqKFPPBkEFMnHXxLAMwAaAKPEKn7a6",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6AW",
+]
 
 
 def set_loaded_accounts_data_size_limit(bytes_limit: int) -> Instruction:
@@ -235,6 +248,7 @@ class SolanaClient:
         priority_fee: int | None = None,
         compute_unit_limit: int | None = None,
         account_data_size_limit: int | None = None,
+        jito_tip_lamports: int | None = None,
     ) -> str:
         """
         Send a transaction with optional priority fee and compute unit limit.
@@ -248,6 +262,8 @@ class SolanaClient:
             compute_unit_limit: Optional compute unit limit. Defaults to 85,000 if not provided.
             account_data_size_limit: Optional account data size limit in bytes (e.g., 512_000).
                                     Reduces CU cost from 16k to ~128 CU. Must be first instruction.
+            jito_tip_lamports: Optional Jito tip in lamports. Adds a SOL transfer to a
+                               randomly selected Jito tip account as the first instruction.
 
         Returns:
             Transaction signature.
@@ -257,6 +273,21 @@ class SolanaClient:
         logger.info(
             f"Priority fee in microlamports: {priority_fee if priority_fee else 0}"
         )
+
+        # Jito tip: SOL transfer to a random tip account — first instruction in the tx
+        if jito_tip_lamports and jito_tip_lamports > 0:
+            tip_account = Pubkey.from_string(random.choice(_JITO_TIP_ACCOUNTS))  # noqa: S311
+            tip_ix = transfer(
+                TransferParams(
+                    from_pubkey=signer_keypair.pubkey(),
+                    to_pubkey=tip_account,
+                    lamports=jito_tip_lamports,
+                )
+            )
+            instructions = [tip_ix] + instructions
+            logger.info(
+                f"Jito tip: {jito_tip_lamports} lamports → {str(tip_account)[:8]}..."
+            )
 
         # Add compute budget instructions if applicable
         if (

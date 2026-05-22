@@ -160,6 +160,8 @@ async def monitor_position(
             preset.get("priority_fee_sol", priority_fee_microlamports / 1_000_000_000)
         )
         fee_ul = int(fee_sol * 1_000_000_000)
+        jito_tip_sol = float(preset.get("jito_tip_sol", 0.003))
+        jito_tip_ul = int(jito_tip_sol * 1_000_000_000) if jito_tip_sol > 0 else None
 
         pf = PriorityFeeManager(
             client=client,
@@ -175,6 +177,7 @@ async def monitor_position(
             priority_fee_manager=pf,
             slippage=sell_slip,
             max_retries=3,
+            jito_tip_lamports=jito_tip_ul,
         )
 
         logger.info(
