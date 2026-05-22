@@ -755,106 +755,8 @@ async def run_scanner(config_path: str) -> None:
         )
 
         # -------------------------------------------------------------------
-        # Parallel data fetch: BC dev buy (stream 1) + dev wallet + GMGN (streams 2+3)
-        # stream 4 (BC signatures) chains inside stream 2+3 right after GMGN returns
+        # Parallel data fetch — single asyncio.gather for all four streams
         # -------------------------------------------------------------------
-        async def _run_stream1_bc() -> float | None:
-            """Stream 1: mint/freeze check (silent) + BC dev buy."""
-            t0 = time.perf_counter()
-            mint_r, bc_r = await asyncio.gather(
-                _check_mint_freeze(mint_str, rpc) if rpc else asyncio.sleep(0, result=(False, False)),
-                _fetch_bc_dev_buy(bc_str, rpc) if (bc_str and rpc) else asyncio.sleep(0, result=None),
-                return_exceptions=True,
-            )
-            elapsed = (time.perf_counter() - t0) * 1000
-
-            has_mint = has_freeze = False
-            if isinstance(mint_r, tuple):
-                has_mint, has_freeze = mint_r
-
-            if isinstance(bc_r, Exception):
-                logger.warning(f"[#{count}] DEV BUY fetch failed for {(bc_str or '')[:8]}: {bc_r}")
-                bc_buy = None
-            elif bc_r is None and bc_str:
-                logger.warning(
-                    f"[#{count}] DEV BUY returned None for {bc_str[:8]} "
-                    f"(account not found or data too short)"
-                )
-                bc_buy = None
-            else:
-                bc_buy = bc_r if isinstance(bc_r, (int, float)) else None
-
-            buy_str = f"{bc_buy:.3f} SOL" if bc_buy is not None else "—"
-            logger.info(
-                f"[#{count}] Stream1 (mint={has_mint} freeze={has_freeze} buy={buy_str}): {elapsed:.0f}ms"
-            )
-            return bc_buy
-
-        async def _run_stream2_then_3() -> tuple[
-            DevWalletInfo, list[TokenHistory], bool, dict[str, tuple[int, int | None]]
-        ]:
-            """Streams 2+3+4: dev wallet + GMGN in parallel, then BC signatures.
-
-            Returns (dev_info, histories, gmgn_failed, sig_data).
-            gmgn_failed=True means a communication error — histories will be empty
-            but that is NOT the same as 'dev has no tokens'.
-            sig_data is populated only when _need_sigs is True and histories is non-empty.
-            """
-            t0 = time.perf_counter()
-
-            dev_coro = (
-                check_dev_wallet(creator_str, rpc)
-                if creator_str and rpc
-                else asyncio.sleep(0, result=DevWalletInfo(address=creator_str or ""))
-            )
-            gmgn_coro = (
-                _get_gmgn_dev_tokens(creator_str, current_mint=mint_str)
-                if creator_str
-                else asyncio.sleep(0, result=[])
-            )
-
-            dev_result, histories_result = await asyncio.gather(
-                dev_coro, gmgn_coro, return_exceptions=True
-            )
-
-            elapsed = (time.perf_counter() - t0) * 1000
-
-            dev = (
-                dev_result
-                if isinstance(dev_result, DevWalletInfo)
-                else DevWalletInfo(address=creator_str or "")
-            )
-            if isinstance(dev_result, Exception):
-                logger.warning(f"[#{count}] Dev wallet check failed: {dev_result}")
-
-            gmgn_failed = isinstance(histories_result, Exception)
-            if gmgn_failed:
-                logger.warning(
-                    f"[#{count}] GMGN fetch failed for {mint_str[:8]}: {histories_result}"
-                )
-                histories: list[TokenHistory] = []
-            else:
-                histories = histories_result if isinstance(histories_result, list) else []
-
-            logger.info(
-                f"[#{count}] Stream2+3 (dev+GMGN): {elapsed:.0f}ms"
-                f" | GMGN tokens: {len(histories)}"
-                f"{' [GMGN FAILED]' if gmgn_failed else ''}"
-            )
-
-            # Stream 4: BC signatures batch — starts immediately after GMGN,
-            # still inside the outer 4 s asyncio.wait_for timeout.
-            sig_data: dict[str, tuple[int, int | None]] = {}
-            if _need_sigs and histories and rpc:
-                t_sig = time.perf_counter()
-                sig_data = await _fetch_token_signatures_batch(histories, rpc)
-                logger.info(
-                    f"[#{count}] Stream4 (sigs x{len(sig_data)}): "
-                    f"{(time.perf_counter() - t_sig) * 1000:.0f}ms"
-                )
-
-            return dev, histories, gmgn_failed, sig_data
-
         dev = DevWalletInfo(address=creator_str, timed_out=True)
         dev_buy_sol: float | None = None
         histories: list[TokenHistory] = []
@@ -862,12 +764,75 @@ async def run_scanner(config_path: str) -> None:
         sig_data: dict[str, tuple[int, int | None]] = {}
 
         try:
-            stream1_result, stream23_result = await asyncio.wait_for(
-                asyncio.gather(_run_stream1_bc(), _run_stream2_then_3()),
+            bc_buy_r, mint_r, dev_r, gmgn_r = await asyncio.wait_for(
+                asyncio.gather(
+                    _fetch_bc_dev_buy(bc_str, rpc) if (bc_str and rpc) else asyncio.sleep(0, result=None),
+                    _check_mint_freeze(mint_str, rpc) if rpc else asyncio.sleep(0, result=(False, False)),
+                    check_dev_wallet(creator_str, rpc) if (creator_str and rpc) else asyncio.sleep(0, result=DevWalletInfo(address=creator_str or "")),
+                    _get_gmgn_dev_tokens(creator_str, current_mint=mint_str) if creator_str else asyncio.sleep(0, result=[]),
+                    return_exceptions=True,
+                ),
                 timeout=4.0,
             )
-            dev_buy_sol = stream1_result
-            dev, histories, gmgn_failed, sig_data = stream23_result
+
+            # BC dev buy
+            if isinstance(bc_buy_r, Exception):
+                logger.warning(
+                    f"[#{count}] DEV BUY fetch failed for {(bc_str or '')[:8]}: {bc_buy_r}"
+                )
+                dev_buy_sol = None
+            elif bc_buy_r is None and bc_str:
+                logger.warning(
+                    f"[#{count}] DEV BUY returned None for {bc_str[:8]} "
+                    "(account not found or data too short)"
+                )
+                dev_buy_sol = None
+            else:
+                dev_buy_sol = bc_buy_r if isinstance(bc_buy_r, (int, float)) else None
+
+            # Mint/freeze (informational only)
+            has_mint = has_freeze = False
+            if isinstance(mint_r, tuple):
+                has_mint, has_freeze = mint_r
+
+            # Dev wallet
+            dev = (
+                dev_r if isinstance(dev_r, DevWalletInfo)
+                else DevWalletInfo(address=creator_str or "")
+            )
+            if isinstance(dev_r, Exception):
+                logger.warning(f"[#{count}] Dev wallet check failed: {dev_r}")
+
+            # GMGN
+            gmgn_failed = isinstance(gmgn_r, Exception)
+            if gmgn_failed:
+                logger.warning(f"[#{count}] GMGN fetch failed for {mint_str[:8]}: {gmgn_r}")
+                histories = []
+            else:
+                histories = gmgn_r if isinstance(gmgn_r, list) else []
+
+            buy_str = f"{dev_buy_sol:.3f} SOL" if dev_buy_sol is not None else "—"
+            logger.info(
+                f"[#{count}] Streams 1-3 (buy={buy_str} mint={has_mint} freeze={has_freeze})"
+                f" | GMGN: {len(histories)} tokens"
+                f"{' [GMGN FAILED]' if gmgn_failed else ''}"
+            )
+
+            # Stream 4: BC signatures — runs after GMGN result is available, own 1.5 s budget
+            if _need_sigs and histories and rpc:
+                t_sig = time.perf_counter()
+                try:
+                    sig_data = await asyncio.wait_for(
+                        _fetch_token_signatures_batch(histories, rpc),
+                        timeout=1.5,
+                    )
+                except TimeoutError:
+                    logger.warning(f"[#{count}] Stream4 (sigs) timed out after 1.5s")
+                logger.info(
+                    f"[#{count}] Stream4 (sigs x{len(sig_data)}): "
+                    f"{(time.perf_counter() - t_sig) * 1000:.0f}ms"
+                )
+
         except TimeoutError:
             logger.warning(f"[#{count}] Overall fetch timeout (4s) — sending with dashes")
         except Exception as e:
