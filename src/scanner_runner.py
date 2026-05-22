@@ -460,16 +460,15 @@ async def _get_gmgn_dev_tokens(dev_wallet: str, current_mint: str = "") -> list[
     except json.JSONDecodeError as e:
         raise RuntimeError(f"gmgn-cli invalid JSON: {e}") from e
 
-    # Sort ascending by create_timestamp so we always get the 5 most recent
-    # previous tokens displayed oldest-first (chronological order).
-    # Without sorting, GMGN returns newest-first; taking [:5] would show the
-    # 5 newest and drop older history when the current token sits in the middle.
+    # Sort descending by create_timestamp: newest first, oldest last.
+    # Ensures the 5 most recent previous tokens are shown regardless of where
+    # the current token sits in GMGN's list.
     sorted_tokens = sorted(
         [t for t in data.get("tokens", []) if t.get("token_address") != current_mint],
         key=lambda t: t.get("create_timestamp") or 0,
+        reverse=True,
     )
-    # Keep the 5 most recent previous tokens (tail of ascending list)
-    selected = sorted_tokens[-5:] if len(sorted_tokens) > 5 else sorted_tokens
+    selected = sorted_tokens[:5]
 
     histories: list[TokenHistory] = []
     for t in selected:
