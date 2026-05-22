@@ -175,5 +175,4 @@ logs/
 *.log.*
 bot_config.json
 skills-lock.json
-CONTEXT.md
 .agents/
