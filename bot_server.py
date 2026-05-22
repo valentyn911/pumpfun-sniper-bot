@@ -53,7 +53,7 @@ DEFAULT_CONFIG = {
             "take_profits": [{"price_pct": 50, "position_pct": 50}],
             "stop_losses": [{"price_pct": 30, "position_pct": 100}],
             "trailing_stop": {"enabled": False, "activation_pct": 30, "trail_size_pct": 20, "position_pct": 50},
-            "filters": {"min_dev_buy_sol": 0.1, "min_ath_last5": 0, "min_migrations_last5": 0},
+            "filters": {"min_dev_buy_sol": 0.1, "min_ath_last5": 0, "min_migrations_last5": 0, "min_entry_mc_usd": 0, "max_entry_mc_usd": 0},
         },
         "2": {
             "name": "Preset 2",
@@ -67,7 +67,7 @@ DEFAULT_CONFIG = {
             "take_profits": [],
             "stop_losses": [],
             "trailing_stop": {"enabled": False, "activation_pct": 50, "trail_size_pct": 20, "position_pct": 100},
-            "filters": {"min_dev_buy_sol": 0.5, "min_ath_last5": 0, "min_migrations_last5": 0},
+            "filters": {"min_dev_buy_sol": 0.5, "min_ath_last5": 0, "min_migrations_last5": 0, "min_entry_mc_usd": 0, "max_entry_mc_usd": 0},
         },
         "3": {
             "name": "Preset 3",
@@ -81,7 +81,7 @@ DEFAULT_CONFIG = {
             "take_profits": [],
             "stop_losses": [],
             "trailing_stop": {"enabled": False, "activation_pct": 100, "trail_size_pct": 30, "position_pct": 100},
-            "filters": {"min_dev_buy_sol": 1.0, "min_ath_last5": 20000, "min_migrations_last5": 1},
+            "filters": {"min_dev_buy_sol": 1.0, "min_ath_last5": 20000, "min_migrations_last5": 1, "min_entry_mc_usd": 0, "max_entry_mc_usd": 0},
         },
     },
 }

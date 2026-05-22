@@ -234,6 +234,97 @@ async def _fetch_bc_dev_buy(bc_address: str, rpc: str) -> float | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# SOL price cache + entry MC helper
+# ---------------------------------------------------------------------------
+
+_sol_price_usd: float = 0.0
+_sol_price_last_updated: float = 0.0
+
+
+async def _get_sol_price_usd() -> float:
+    """Return SOL/USD price, refreshed at most once per 60 s from Binance."""
+    global _sol_price_usd, _sol_price_last_updated
+    now = time.time()
+    if now - _sol_price_last_updated < 60 and _sol_price_usd > 0:
+        return _sol_price_usd
+    try:
+        timeout = aiohttp.ClientTimeout(total=3.0)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(
+                "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT"
+            ) as r:
+                data = await r.json()
+                _sol_price_usd = float(data["price"])
+                _sol_price_last_updated = now
+                return _sol_price_usd
+    except Exception:
+        return _sol_price_usd if _sol_price_usd > 0 else 150.0
+
+
+async def _get_current_token_price_sol(bc_address: str, rpc: str) -> float | None:
+    """Read bonding-curve reserves and return current price in SOL/token."""
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [bc_address, {"encoding": "base64", "commitment": "confirmed"}],
+        }
+        timeout = aiohttp.ClientTimeout(total=2.0)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(rpc, json=payload) as resp:
+                data = await resp.json()
+        value = data.get("result", {}).get("value")
+        if not value:
+            return None
+        raw_data = value.get("data")
+        if not raw_data or not isinstance(raw_data, list):
+            return None
+        account_bytes = base64.b64decode(raw_data[0])
+        if len(account_bytes) < 24:
+            return None
+        vtoken = struct.unpack_from("<Q", account_bytes, 8)[0]
+        vsol = struct.unpack_from("<Q", account_bytes, 16)[0]
+        if vtoken <= 0 or vsol <= 0:
+            return None
+        # price in SOL per full token (6 decimals)
+        return (vsol / vtoken) * (10**6) / 1_000_000_000
+    except Exception:
+        return None
+
+
+async def _check_entry_mc(
+    filt: dict,
+    bc_address: str | None,
+    rpc: str | None,
+    token_label: str,
+) -> tuple[bool, str]:
+    """Return (passes, skip_reason_or_empty). Skips check when both limits are 0."""
+    min_mc = float(filt.get("min_entry_mc_usd", 0))
+    max_mc = float(filt.get("max_entry_mc_usd", 0))
+    if min_mc <= 0 and max_mc <= 0:
+        return True, ""
+    if not bc_address or not rpc:
+        return True, ""
+    cur_price_sol = await _get_current_token_price_sol(bc_address, rpc)
+    if cur_price_sol is None or cur_price_sol <= 0:
+        return True, ""
+    sol_usd = await _get_sol_price_usd()
+    cur_mc_usd = cur_price_sol * 1_000_000_000 * sol_usd
+    if min_mc > 0 and cur_mc_usd < min_mc:
+        logger.info(
+            f"[MC filter] {token_label}: MC=${cur_mc_usd:.0f} < min=${min_mc:.0f} → skip"
+        )
+        return False, f"\n⛔ MC ${cur_mc_usd:,.0f} — ниже min MC ${min_mc:,.0f}"
+    if max_mc > 0 and cur_mc_usd > max_mc:
+        logger.info(
+            f"[MC filter] {token_label}: MC=${cur_mc_usd:.0f} > max=${max_mc:.0f} → skip"
+        )
+        return False, f"\n⛔ MC ${cur_mc_usd:,.0f} — выше max MC ${max_mc:,.0f}"
+    return True, ""
+
+
 async def _check_mint_freeze(mint_str: str, rpc: str) -> tuple[bool, bool]:
     """Check mint and freeze authorities. Returns (has_mint_auth, has_freeze_auth)."""
     payload = {
@@ -1130,53 +1221,59 @@ async def run_scanner(config_path: str) -> None:
                     jito_tip_lamports=cur_jito_tip_ul,
                 )
 
-                await _update_bot_config({"open_positions": open_pos + 1})
+                mc_passes, mc_skip_msg = await _check_entry_mc(
+                    filt, bc_str, rpc, f"#{count}"
+                )
+                if not mc_passes:
+                    buy_block = mc_skip_msg
+                else:
+                    await _update_bot_config({"open_positions": open_pos + 1})
 
-                logger.info(f"[#{count}] Buying token {str(token_info.mint)[:8]}...")
-                try:
-                    buy_result = await fresh_buyer.execute(token_info)
-                    if buy_result.success:
-                        buy_block = (
-                            f"\n✅ КУПЛЕНО: {cur_buy_amount:.4f} SOL | Fee: {cur_priority_sol:.4f} SOL"
-                        )
-                        logger.info(f"[#{count}] Buy success: {buy_result.tx_signature}")
-                        await _update_bot_config({
-                            "stats": {
-                                "buys_executed": (
-                                    ((bot_cfg or {}).get("stats") or {}).get("buys_executed", 0) + 1
-                                )
-                            }
-                        })
-                        if (
-                            buy_result.amount is not None
-                            and buy_result.price is not None
-                            and buyer_client is not None
-                        ):
-                            asyncio.create_task(
-                                monitor_position(
-                                    token_info=token_info,
-                                    token_amount=buy_result.amount,
-                                    entry_price=buy_result.price,
-                                    client=buyer_client,
-                                    wallet=wallet,
-                                    read_config=_read_bot_config,
-                                    update_config=_update_bot_config,
-                                    preset_id=active_preset_id,
-                                    priority_fee_microlamports=cur_priority_ul,
-                                    notify_fn=tg.send_message,
-                                )
+                    logger.info(f"[#{count}] Buying token {str(token_info.mint)[:8]}...")
+                    try:
+                        buy_result = await fresh_buyer.execute(token_info)
+                        if buy_result.success:
+                            buy_block = (
+                                f"\n✅ КУПЛЕНО: {cur_buy_amount:.4f} SOL | Fee: {cur_priority_sol:.4f} SOL"
                             )
-                    else:
-                        err = _escape_html(buy_result.error_message or "unknown error")
-                        buy_block = f"\n\n❌ Покупка не удалась: {err}"
-                        logger.warning(f"[#{count}] Buy failed: {buy_result.error_message}")
+                            logger.info(f"[#{count}] Buy success: {buy_result.tx_signature}")
+                            await _update_bot_config({
+                                "stats": {
+                                    "buys_executed": (
+                                        ((bot_cfg or {}).get("stats") or {}).get("buys_executed", 0) + 1
+                                    )
+                                }
+                            })
+                            if (
+                                buy_result.amount is not None
+                                and buy_result.price is not None
+                                and buyer_client is not None
+                            ):
+                                asyncio.create_task(
+                                    monitor_position(
+                                        token_info=token_info,
+                                        token_amount=buy_result.amount,
+                                        entry_price=buy_result.price,
+                                        client=buyer_client,
+                                        wallet=wallet,
+                                        read_config=_read_bot_config,
+                                        update_config=_update_bot_config,
+                                        preset_id=active_preset_id,
+                                        priority_fee_microlamports=cur_priority_ul,
+                                        notify_fn=tg.send_message,
+                                    )
+                                )
+                        else:
+                            err = _escape_html(buy_result.error_message or "unknown error")
+                            buy_block = f"\n\n❌ Покупка не удалась: {err}"
+                            logger.warning(f"[#{count}] Buy failed: {buy_result.error_message}")
+                            cur_cfg = _read_bot_config() or {}
+                            await _update_bot_config({"open_positions": max(0, cur_cfg.get("open_positions", 1) - 1)})
+                    except Exception as e:
+                        buy_block = f"\n\n❌ Покупка не удалась: {_escape_html(str(e))}"
+                        logger.error(f"[#{count}] Buy exception: {e}")
                         cur_cfg = _read_bot_config() or {}
                         await _update_bot_config({"open_positions": max(0, cur_cfg.get("open_positions", 1) - 1)})
-                except Exception as e:
-                    buy_block = f"\n\n❌ Покупка не удалась: {_escape_html(str(e))}"
-                    logger.error(f"[#{count}] Buy exception: {e}")
-                    cur_cfg = _read_bot_config() or {}
-                    await _update_bot_config({"open_positions": max(0, cur_cfg.get("open_positions", 1) - 1)})
 
         full_message += buy_block
         success = await tg.send_message(full_message)

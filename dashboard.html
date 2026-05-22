@@ -451,6 +451,14 @@ function buildFiltersCol(n, p) {
   </label>
 </div>
 
+<label>Entry MC Range ($)</label>
+<div style="display:flex;align-items:center;gap:6px">
+  <input type="number" id="p${n}_min_entry_mc" value="${f.min_entry_mc_usd ?? 0}" min="0" placeholder="Min" style="width:84px">
+  <span style="font-size:11px;color:var(--muted)">–</span>
+  <input type="number" id="p${n}_max_entry_mc" value="${f.max_entry_mc_usd ?? 0}" min="0" placeholder="Max" style="width:84px">
+</div>
+<div class="field-hint">0 = disabled. Bot only buys if MC is within this range at entry moment.</div>
+
 <h3>Trailing Stops <span style="color:var(--muted);font-weight:400">(up to 3)</span></h3>
 <div id="trail-rows-${n}">${(()=>{
   const tsList = p.trailing_stops || (p.trailing_stop ? [p.trailing_stop] : []);
@@ -718,6 +726,8 @@ function readPreset(n) {
       tx_count_require_all: checked(`p${n}_tx_require_all`),
       min_lifetime_minutes: v(`p${n}_min_lifetime`),
       lifetime_require_all: checked(`p${n}_lt_require_all`),
+      min_entry_mc_usd: Math.round(v(`p${n}_min_entry_mc`)),
+      max_entry_mc_usd: Math.round(v(`p${n}_max_entry_mc`)),
     },
   };
 }
