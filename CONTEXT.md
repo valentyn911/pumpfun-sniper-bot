@@ -389,27 +389,54 @@ Data guards → Filter 3 (ATH) → Filter 4 (Mig) → Filter 5 (TX) → Filter 6
 
 ### Completed This Session
 
-- **Jito MEV tip**: `jito_tip_sol` field in all presets; tip instruction injected as first instruction in every tx (buy + sell); random tip account selected per-tx from 8 official Jito tip accounts; wired through `core/client.py` → `PlatformAwareBuyer/Seller` → `scanner_position_monitor._sell()` → dashboard Jito Tip field
-- **Dev buy display fix**: Was reading `virtual_sol_reserves` from BC account ~500 ms after event, inflated by other snipers' buys. Fix: use `solAmount` from PumpPortal event directly (new `dev_buy_sol` field on `TokenInfo`). Old `_fetch_bc_dev_buy()` kept as fallback for non-PumpPortal listeners.
-- **Market Cap Range entry filter**: `min_entry_mc_usd` / `max_entry_mc_usd` in filters (0 = disabled). Checked immediately before buy — reads BC reserves → price SOL/token × 1B supply × SOL/USD. SOL/USD served by a background `_sol_price_updater()` task (Binance, every 30 s) — zero latency on buy path. Dashboard inputs added to Entry Filters section.
+1. **Trailing stop verified production-ready** — trail measured from activation price (not entry), multiple independent stops with separate `peak` state, partial sells chain correctly. `trailing_stops` array (up to 3 entries) replaces old single `trailing_stop` object; backward compat kept in `scanner_position_monitor.py`.
 
-### Real Latency Numbers (from logs — 6,923 tokens, PumpPortal listener)
+2. **`bot_config.json` / `DEFAULT_CONFIG` schema fix** — `bot_server.py` `DEFAULT_CONFIG` now uses `"trailing_stops": []` (array) instead of `"trailing_stop": {}` (single object).
+
+3. **`fired` flag order fix in position monitor** — flag was set before the sell attempt, causing permanently skipped levels on failed transactions. Fixed to mark fired only after a successful sell.
+
+4. **Helius Staked URL** — confirmed used for both buy (`buyer_client`) and sell (`PlatformAwareSeller`). No change needed.
+
+5. **Dev buy amount bug fixed** — bot reported "11.292 SOL" instead of ~1 SOL. Root cause: `_fetch_bc_dev_buy()` read `virtual_sol_reserves` from the bonding-curve account ~500 ms after launch, by which time other snipers had already bought in, inflating the value. Fix: read `solAmount` directly from the PumpPortal event payload (exact SOL the dev spent in the create tx). New `dev_buy_sol` field added to `TokenInfo`; old RPC fallback preserved for non-PumpPortal listeners. Files changed: `pumpportal_processor.py`, `interfaces/core.py`, `scanner_runner.py`.
+
+6. **Market Cap Range entry filter** — `min_entry_mc_usd` / `max_entry_mc_usd` in filters (0 = disabled). Checked immediately before the buy transaction: reads BC reserves → price SOL/token × 1B supply × SOL/USD price. SOL/USD updated by background `_sol_price_updater()` task (Binance, every 30 s) — zero HTTP latency on the buy path. Added to dashboard Entry Filters section, all 3 presets, and `DEFAULT_CONFIG`.
+
+7. **Jito MEV tip** — `jito_tip_sol` field in all presets (default 0.003). SOL transfer to a random Jito tip account injected as the first instruction in every transaction (buy + sell). Wired through `core/client.py` → `PlatformAwareBuyer/Seller` → `scanner_position_monitor._sell()`. Dashboard Jito Tip field added between Priority Fee and Gas Fee.
+
+8. **Dev token history sort order fixed** — now newest launch first (descending by `create_timestamp`). Old code showed oldest first. Also fixed `[:5]` to be taken after sort so the 5 most recent tokens are always shown regardless of where the current token sits in GMGN's list.
+
+9. **GMGN history showing 1 token instead of 5 — investigated** — not a code bug. At SHIM's detection time GMGN only had 2 tokens for that dev (FCA + SHIM); the other 4 were launched 8–17 min later. Code was correct; sort fix ensures right tokens are selected when GMGN has them.
+
+10. **GMGN subprocess → direct HTTP API** — eliminated `npx gmgn-cli` subprocess overhead:
+    - Old: subprocess spawn + Node.js init + CLI = **~763 ms avg**
+    - New: `aiohttp` GET to `openapi.gmgn.ai` = **~265 ms avg**
+    - Savings: **~500 ms per token** (Phase1 bottleneck cut by 65%)
+    - Endpoint: `https://openapi.gmgn.ai/v1/user/created_tokens`
+    - Auth: `X-APIKEY` header + `timestamp` (unix sec) + `client_id` (UUID) query params
+    - Fallback: logs `[GMGN HTTP] ... fallback to CLI` and runs subprocess if API key missing or HTTP fails
+    - Total pipeline: **~390 ms avg** (was ~890 ms)
+
+### Real Latency Numbers (from logs — 6,923 tokens, PumpPortal listener, pre-HTTP-fix)
 
 | Stage | Avg | Min | Max |
 |---|---|---|---|
-| mint→Phase1 complete (GMGN + dev wallet) | 763 ms | 614 ms | 3024 ms |
+| mint→GMGN + dev wallet complete | 763 ms | 614 ms | 3024 ms |
 | Stream4 (getSignaturesForAddress ×N) | 151 ms | 78 ms | 1506 ms |
-| mint→all filters done (Phase1+sigs) | 890 ms | 615 ms | 3025 ms |
-| filters→send (buy tx) | logged — no buys yet (auto_trading=false) |
-| send→confirm | logged — no buys yet (auto_trading=false) |
+| mint→all filters done | 890 ms | 615 ms | 3025 ms |
+| filters→send (buy tx) | not yet measured — auto_trading=false |
+| send→confirm | not yet measured — auto_trading=false |
 
-GMGN is the bottleneck (~763 ms avg). `[TIMING]` log lines now emitted for all 4 stages so buy-path latency will appear in logs once auto_trading is enabled.
+After HTTP fix: GMGN avg drops from 763 ms → ~265 ms. Total pipeline: ~390 ms expected.
 
-### `bot_config.json` breaking change
-
-`trailing_stop` single object → `trailing_stops` array. Backward compat kept in `scanner_position_monitor.py` (reads both forms).
+`[TIMING]` log lines now emitted for all 4 buy-path stages; real numbers will appear once `auto_trading = true`.
 
 ### Current Status
 
-- **auto_trading = false** — scan + alert only, no real buys
-- **All timing instrumented**: `[TIMING] mint→filters`, `filters→send`, `send→confirm`, `mint→confirm` logged on every buy
+- **auto_trading = false** — scan + alert only, no real buys executed
+- **All timing instrumented**: `[TIMING] mint→filters`, `filters→send`, `send→confirm`, `mint→confirm`
+
+### Open Tasks (next session)
+
+- Enable `auto_trading = true` with small amount (0.01 SOL) and monitor real buy timing logs
+- Verify Jito tip flow end-to-end in a real transaction (check explorer)
+- Consider Geyser integration for faster mint detection (~100 ms vs ~300 ms PumpPortal)
