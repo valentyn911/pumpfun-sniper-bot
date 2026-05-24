@@ -6,17 +6,17 @@ Read this file at the start of every session to get full project context without
 
 ## Purpose
 
-Automated Solana token sniper for **pump.fun** and **letsbonk.fun**.
+Automated Solana token sniper for **pump.fun** (and letsbonk.fun, partially).
 
 For every new token launch the bot:
 1. Detects the token in real-time (WebSocket listener)
 2. Fetches dev wallet info, GMGN token history, and on-chain BC dev-buy amount — in parallel
-3. Applies configurable filters (min dev buy, ATH of dev's last 5 tokens, migration count)
-4. Sends a full Telegram alert (passes or rejects with reason)
-5. Optionally auto-buys tokens that pass all filters
+3. Applies configurable filters (min dev buy, ATH of dev's last 5 tokens, migration count, TX count, lifetime, entry MC)
+4. Sends a Telegram alert (✅ passes all filters OR ❌ rejected with reason — suppressed when at capacity)
+5. Optionally auto-buys tokens that pass all filters (live or test/simulation mode)
 6. Monitors open positions via `accountSubscribe` WebSocket and auto-sells on TP / SL / trailing stop
 
-Controlled through a local web dashboard (`dashboard.html` served by `bot_server.py` on `localhost:8765`).
+Controlled via a local web dashboard (`dashboard.html` served by `bot_server.py` on `localhost:8765`).
 
 ---
 
@@ -26,417 +26,365 @@ Controlled through a local web dashboard (`dashboard.html` served by `bot_server
 |---|---|
 | Language | Python 3.11+ |
 | Blockchain | Solana mainnet |
+| Runtime | `uv` (virtualenv + deps) |
 | RPC / WebSocket | Helius (`mainnet.helius-rpc.com`) |
 | Fast tx submission | Helius Staked Transactions (`staked.helius-rpc.com`) |
-| Token detection | PumpPortal WebSocket (default), blockSubscribe, logsSubscribe, Geyser (gRPC) |
-| Position monitoring | Solana `accountSubscribe` WebSocket (event-driven, no polling) |
-| On-chain decoding | Direct struct.unpack on raw account bytes (no IDL dependency for price) |
-| Dev history | `gmgn-cli` NPX subprocess → JSON |
-| Notifications | Telegram Bot API (HTML parse mode) |
-| Dashboard | Pure HTML/JS + Python stdlib `HTTPServer` |
-| Config | `bot_config.json` (runtime state) + `bots/*.yaml` (scanner config) + `.env` (secrets) |
-| Package manager | `uv` |
-| Linter / formatter | Ruff |
+| Token history | GMGN OpenAPI (primary) + gmgn-cli subprocess (fallback) |
+| Telegram | `aiohttp` direct HTTP (no library) |
+| Dashboard server | Python `http.server.HTTPServer` on port 8765 |
+| Async event loop | `asyncio` + `uvloop` (optional, auto-detected) |
 
 ---
 
-## File & Folder Structure
+## Directory Structure
 
 ```
 pumpfun-bonkfun-bot/
-│
-├── bot_server.py                  # Dashboard HTTP server (port 8765)
-├── dashboard.html                 # Web UI for config, presets, stats, wallet
-├── bot_config.json                # Runtime config: presets, stats, open_positions (gitignored)
-├── push.sh                        # One-command git push shortcut
-├── CONTEXT.md                     # This file
-├── CLAUDE.md                      # Claude Code instructions (project conventions)
-│
-├── bots/                          # Scanner/sniper YAML configs
-│   ├── bot-scanner-telegram.yaml  # Main scanner config (used by bot_server.py)
-│   ├── bot-sniper-1-geyser.yaml
-│   ├── bot-sniper-2-logs.yaml
-│   ├── bot-sniper-3-blocks.yaml
-│   └── bot-sniper-4-pp.yaml
-│
 ├── src/
-│   ├── scanner_runner.py          # Main scanner loop (token detection → filter → buy)
-│   ├── scanner_position_monitor.py # Position monitor (accountSubscribe TP/SL/trailing)
-│   ├── bot_runner.py              # Original sniper bot entry point (pre-dashboard)
-│   ├── config_loader.py           # YAML config loader with env-var interpolation
-│   │
-│   ├── core/
-│   │   ├── client.py              # SolanaClient: RPC calls, tx send, account fetch
-│   │   ├── wallet.py              # Keypair loading from base58 private key
-│   │   ├── pubkeys.py             # Program IDs, constants (LAMPORTS_PER_SOL, etc.)
-│   │   ├── rpc_rate_limiter.py    # Token-bucket RPC rate limiter
-│   │   └── priority_fee/
-│   │       ├── manager.py         # PriorityFeeManager: fixed or dynamic fee
-│   │       ├── dynamic_fee.py     # getRecentPrioritizationFees-based dynamic fee
-│   │       └── fixed_fee.py       # Fixed microlamport fee
-│   │
-│   ├── interfaces/
-│   │   └── core.py                # Abstract base types: Platform enum, TokenInfo dataclass,
-│   │                              #   BuyResult, SellResult, BaseBuyer/Seller interfaces
-│   │
-│   ├── platforms/
-│   │   ├── pumpfun/
-│   │   │   ├── address_provider.py   # Derive bonding-curve-v2 PDA, fee recipient
-│   │   │   ├── curve_manager.py      # Decode BC account, compute buy/sell amounts
-│   │   │   ├── event_parser.py       # Parse CreateEvent from logsSubscribe / blockSubscribe
-│   │   │   ├── instruction_builder.py # Build buy/sell Solana instructions (18/16/17 accounts)
-│   │   │   └── pumpportal_processor.py # Parse PumpPortal WS messages → TokenInfo
-│   │   └── letsbonk/
-│   │       ├── address_provider.py
-│   │       ├── curve_manager.py      # Decode pool-state via IDL
-│   │       ├── event_parser.py
-│   │       ├── instruction_builder.py
-│   │       └── pumpportal_processor.py
-│   │
+│   ├── scanner_runner.py          # Main bot loop — listener, filters, buy dispatch
+│   ├── scanner_position_monitor.py # Position monitor — WebSocket accountSubscribe, TP/SL/trail
 │   ├── monitoring/
-│   │   ├── base_listener.py           # Abstract BaseListener
-│   │   ├── listener_factory.py        # ListenerFactory.create_listener(type, ...)
-│   │   ├── universal_logs_listener.py # logsSubscribe-based listener
-│   │   ├── universal_block_listener.py # blockSubscribe-based listener
-│   │   ├── universal_geyser_listener.py # Geyser gRPC listener
-│   │   ├── universal_pumpportal_listener.py # PumpPortal WebSocket listener
-│   │   ├── dev_checker.py             # Fetch dev wallet age, SOL balance, launch count
-│   │   └── onchain_checker.py         # On-chain helpers (mint/freeze authority check)
-│   │
-│   ├── trading/
-│   │   ├── base.py                # BaseBuyer / BaseSeller
-│   │   ├── platform_aware.py      # PlatformAwareBuyer / PlatformAwareSeller
-│   │   │                          #   (dispatches to pumpfun or letsbonk impl)
-│   │   ├── universal_trader.py    # High-level trader with retry logic
-│   │   └── position.py            # Position state tracking
-│   │
+│   │   └── dev_checker.py         # Dev wallet info: balance, age, pump.fun history
 │   ├── notifications/
-│   │   └── telegram_reporter.py   # TelegramReporter: send_message, send_startup_message
-│   │
-│   ├── cleanup/
-│   │   ├── manager.py             # CleanupManager: close empty token accounts
-│   │   └── modes.py               # Cleanup modes enum
-│   │
-│   ├── utils/
-│   │   ├── logger.py              # get_logger(), setup_file_logging()
-│   │   ├── idl_manager.py         # Load / cache IDL JSON files
-│   │   └── idl_parser.py          # Parse Anchor IDL → instruction layout
-│   │
-│   └── geyser/                    # Generated protobuf stubs for Geyser gRPC
-│
-├── idl/                           # Solana program IDL files
-│   ├── pump_fun_idl.json          # pump.fun IDL (incomplete — see CLAUDE.md)
-│   ├── pump_swap_idl.json         # PumpSwap (post-migration AMM)
-│   ├── pump_fees.json
-│   ├── raydium_amm_idl.json
-│   └── raydium_launchlab_idl.json
-│
-├── learning-examples/             # Standalone research / test scripts (not production)
-│   ├── manual_buy.py / manual_sell.py
-│   ├── bonding-curve-progress/
-│   ├── listen-new-tokens/
-│   ├── listen-migrations/
-│   ├── pumpswap/
-│   ├── letsbonk-buy-sell/
-│   └── ...
-│
-└── .env                           # Secrets (gitignored)
-    # Keys: SOLANA_NODE_RPC_ENDPOINT, SOLANA_NODE_WSS_ENDPOINT,
-    #       SOLANA_PRIVATE_KEY, HELIUS_STAKED_URL,
-    #       TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-    #       GMGN_API_KEY, GEYSER_ENDPOINT, GEYSER_API_TOKEN,
-    #       BUY_AMOUNT_SOL, BUY_SLIPPAGE, PRIORITY_FEE_SOL, AUTO_BUY_ENABLED
+│   │   └── telegram_reporter.py   # Send Telegram messages via Bot API
+│   ├── trading/
+│   │   └── platform_aware.py      # PlatformAwareBuyer + PlatformAwareSeller
+│   ├── core/                      # SolanaClient, Wallet, PriorityFeeManager, pubkeys
+│   ├── platforms/                 # pump.fun + letsbonk address derivation + IX builders
+│   └── interfaces/                # TokenInfo, Platform enum, abstract interfaces
+├── bot_server.py                  # Dashboard HTTP server + bot process control
+├── dashboard.html                 # Single-page control dashboard (served at localhost:8765)
+├── bot_config.json                # Live runtime config (gitignored) — presets, stats, flags
+├── bots/
+│   └── bot-scanner-telegram.yaml  # Bot startup config (platform, listener, env vars)
+├── idl/
+│   └── pump_fun_idl.json          # Pump.fun Anchor IDL (incomplete — see CLAUDE.md gotchas)
+├── logs/                          # Per-session log files (gitignored)
+├── .env                           # Private keys, RPC endpoints, API keys (gitignored)
+└── CONTEXT.md                     # This file
 ```
 
 ---
 
 ## Key Files — What Each Does
 
-### `src/scanner_runner.py`
-The main entry point for the scanning bot. Run via `bot_server.py` or directly with `uv run src/scanner_runner.py bots/bot-scanner-telegram.yaml`.
+### `src/scanner_runner.py` (1826 lines)
+Central bot coroutine. Entry point: `run_scanner(config_path)`.
 
-Flow per new token:
-1. **Deduplication** — `processed_mints` dict prevents double-processing the same mint (logsSubscribe fires multiple log entries per tx)
-2. **Parallel fetch (4 s timeout)**:
-   - Stream 1: mint/freeze authority check + BC dev-buy SOL from raw account bytes
-   - Stream 2+3: dev wallet stats (`check_dev_wallet`) + GMGN last-5-tokens history (`gmgn-cli`)
-3. **Data quality guards** — if any source timed out, GMGN failed, or dev has no history → reject with reason
-4. **Filter 2**: dev buy >= `min_dev_buy_sol`
-5. **Filter 3**: ATH of dev's last 5 tokens vs `min_ath_last5` (any-1 or all-5 mode)
-6. **Filter 4**: migrations count vs `min_migrations_last5`
-7. **Telegram alert** — full message with checkmark or X + reason
-8. **Auto-buy** — if `auto_trading=true` and position limit not reached, buys via `PlatformAwareBuyer`
-9. **Position monitor** — after successful buy, spawns `monitor_position()` as asyncio task
+**Key globals:**
+- `_position_entry_lock: asyncio.Lock` — atomic gate for claiming position slots
+- `_sol_price_usd: float` — refreshed every 30 s from Binance
+- `processed_mints: dict[str, float]` — deduplication (mint → first-seen monotonic time, cleaned every 60 s)
+- `_BOT_CONFIG_PATH` — path to `bot_config.json`
 
-Reads live settings from `bot_config.json` on every token so changes take effect without restart.
+**Config helpers:**
+- `_read_bot_config() -> dict | None` — synchronous JSON read (called frequently, non-blocking)
+- `_update_bot_config(updates: dict)` — async merge write under `_config_lock`; handles nested `"stats"` dict specially (merges instead of overwrites)
 
-### `src/scanner_position_monitor.py`
-Monitors an open position after a buy. Uses Solana `accountSubscribe` WebSocket — every on-chain buy/sell of the token triggers a notification, giving ~50–200 ms latency vs 1 s polling.
+**Main flow per token:**
+1. `on_new_token(token_info)` — deduplication check, increments `tokens_found_today`, dispatches `_check_and_notify` as `create_task`
+2. `_check_and_notify(token_info, count, rpc, tg)`:
+   - **STEP 1**: Read `open_positions` / `max_concurrent_positions` → set `_any_position_open` and `_at_capacity`. If `_at_capacity` → silent return immediately (no Telegram, no data fetch)
+   - Fetches dev wallet info + GMGN history concurrently (4 s timeout) + BC dev-buy RPC in background
+   - Applies filters 1–6 (mayhem skip, data quality, ATH, migrations, TX count, lifetime, dev buy). Each rejection sends Telegram ONLY when `not _any_position_open`
+   - On all-pass: sends ✅ alert
+   - **Live buy path**: if `auto_trading=True`, creates fresh `PlatformAwareBuyer` per buy (reads preset live), takes `_position_entry_lock`, re-checks capacity, increments `open_positions`, executes buy, launches `monitor_position` task with `position_close_fn=None`
+   - **Test mode path**: if `test_mode=True`, takes same `_position_entry_lock`, increments `open_positions`, simulates buy, launches `monitor_position_test` task with `_on_test_close` as `position_close_fn`
 
-On each account notification:
-- Decodes raw bonding-curve bytes → current price (no extra RPC call)
-- Re-reads `bot_config.json` for live TP/SL settings
-- Checks stop-loss levels (ascending order, one action per notification)
-- Checks take-profit levels (ascending order, one action per notification)
-- Checks trailing stop (activate → track peak → fire when drop from peak exceeds threshold)
-- Executes sell via `PlatformAwareSeller`, sends Telegram notification
-- Decrements `open_positions` in `bot_config.json` when position closes
+**Position slot lifecycle (live):**
+- `open_positions` incremented inside `_position_entry_lock` (atomic)
+- `monitor_position` decrements in its `finally` block unconditionally
+- Failure paths before monitor launch decrement immediately: `await _update_bot_config({"open_positions": max(0, open_pos)})`
+- `open_pos` variable = value BEFORE increment (used for rollback: `max(0, open_pos)` = previous value)
 
-`position_pct` in each level = % of **remaining** tokens (not original), so you can chain partial exits.
+**Position slot lifecycle (test):**
+- Same: `open_positions` incremented inside lock
+- `_on_test_close()` creates async task that decrements
+- `monitor_position_test` calls `position_close_fn()` in its `finally`
+- Failure paths before monitor launch decrement immediately
 
-### `dashboard.html`
-Single-page web UI. Fetches config from `bot_server.py` REST API on load. Features:
-- **Bot Control**: Start / Stop bot process, Auto Trading toggle, Infinite / N-trades mode, max concurrent positions
-- **Wallet**: Enter private key (saved to `.env`), show public address, SOL balance
-- **Presets** (3 tabs): Buy amount, priority fee, gas fee, slippage, max retries, entry filters (min dev buy, ATH threshold, migration count), take-profit rows (up to 8), stop-loss rows (up to 3), trailing stop
-- **Stats**: Tokens found today, passed filters, buys executed, open positions
+### `src/scanner_position_monitor.py` (954 lines)
 
-All changes save to `bot_config.json` via `POST /api/config`. Preset activation updates `active_preset`.
+**Live monitor** (`monitor_position`):
+- `accountSubscribe` WebSocket loop — fires on every on-chain buy/sell of the token
+- Decodes raw BC account bytes → current price (no extra RPC)
+- Checks SL, TP, trailing stops on every price tick
+- Sells via `PlatformAwareSeller`, retries until confirmed, then marks level as fired
+- `finally` block: decrements `open_positions`, calls `position_close_fn` if set
+- Crashes notify Telegram with "open_positions may need manual reset" warning
 
-### `bot_server.py`
-Minimal Python stdlib HTTP server on `localhost:8765`. No dependencies beyond the project itself.
+**Test monitor** (`monitor_position_test`):
+- Same WebSocket loop, same price decode
+- Simulates sells (no on-chain execution), sends Telegram notifications
+- Uses `preset_snapshot` from entry time (never re-reads config)
+- On full close: calls `_update_test_stat(key, pnl_delta)` to write `test_wins`/`test_losses`/`test_total_pnl_sol`
+- `finally` block: calls `position_close_fn()` — does NOT touch `open_positions` directly
 
-| Endpoint | Method | Description |
+**Stat writers:**
+- `_update_test_stat(key, pnl_delta)` — reads file inside `_spm_config_lock`, increments `test_wins`/`test_losses`, accumulates `test_total_pnl_sol`
+- `_update_live_stat(key, pnl_delta)` — same pattern for `real_wins`/`real_losses`/`real_total_pnl_sol`. Called from `_sell()` when `remaining <= _DUST_TOKENS` (full position close only)
+
+**Note on locks:** `_spm_config_lock` (in this file) and `_config_lock` (in scanner_runner) are separate locks protecting the same `bot_config.json`. Stat writes are infrequent, so real-world collision risk is low. A formal fix would require sharing a lock.
+
+### `bot_server.py` (409 lines)
+
+HTTP server for the dashboard. Endpoints:
+
+| Method | Path | Description |
 |---|---|---|
-| `/` | GET | Serve `dashboard.html` |
-| `/api/status` | GET | Bot running state + stats + open positions |
-| `/api/config` | GET | Full `bot_config.json` |
-| `/api/config` | POST | Overwrite `bot_config.json` |
-| `/api/balance` | GET | SOL balance via RPC |
-| `/api/start` | POST | Kill existing + start `scanner_runner.py` subprocess |
-| `/api/stop` | POST | `pkill -f scanner_runner.py` |
-| `/api/save-key` | POST | Write `SOLANA_PRIVATE_KEY` to `.env` |
+| GET | `/` | Serve `dashboard.html` |
+| GET | `/api/status` | `{running, pubkey, stats, open_positions, max_concurrent_positions}` |
+| GET | `/api/config` | Full `bot_config.json` contents |
+| GET | `/api/balance` | SOL balance via RPC `getBalance` |
+| GET | `/api/wallet` | `{pubkey}` |
+| POST | `/api/start` | Kill existing scanner, reset stats+counter, start fresh |
+| POST | `/api/stop` | Kill scanner, unconditionally reset stats+counter |
+| POST | `/api/reset-positions` | Set `open_positions=0` only (stats untouched) |
+| POST | `/api/config` | Save full config JSON |
+| POST | `/api/save-key` | Write `SOLANA_PRIVATE_KEY` to `.env` |
 
-Start with: `python bot_server.py`
+**Important**: `/api/stop` resets stats AND `open_positions` unconditionally (not guarded by whether the bot was actually running). This is intentional — fixes stuck counter when bot crashes.
 
-### `bot_config.json`
-Runtime state file read/written by both `bot_server.py` and `scanner_runner.py`. **Gitignored** (contains runtime state, reset on each bot start).
+### `bot_config.json` (runtime, gitignored)
 
-Key fields:
 ```json
 {
   "active_preset": 1,
   "max_concurrent_positions": 1,
   "open_positions": 0,
   "auto_trading": false,
-  "mode": "n",
+  "test_mode": false,
+  "mode": "infinite",
   "max_trades": 10,
-  "stats": { "tokens_found_today": 0, "tokens_passed_filters": 0, "buys_executed": 0 },
+  "stats": {
+    "tokens_found_today": 0,
+    "tokens_passed_filters": 0,
+    "buys_executed": 0,
+    "test_buys_executed": 0,
+    "test_wins": 0,
+    "test_losses": 0,
+    "test_total_pnl_sol": 0.0,
+    "real_wins": 0,
+    "real_losses": 0,
+    "real_total_pnl_sol": 0.0
+  },
   "presets": {
-    "1": {
-      "buy_amount_sol": 0.01, "priority_fee_sol": 0.001, "gas_fee_sol": 0.00005,
-      "buy_slippage": 30, "sell_slippage": 30, "max_retries": 2,
-      "take_profits": [{ "price_pct": 20, "position_pct": 95 }],
-      "stop_losses":  [{ "price_pct": 30, "position_pct": 95 }],
-      "trailing_stops": [{ "enabled": true, "activation_pct": 10, "trail_size_pct": 20, "position_pct": 95 }],
-      "filters": { "min_dev_buy_sol": 0.1, "min_ath_last5": 3000, "ath_require_all": true, "min_migrations_last5": 0, "min_entry_mc_usd": 0, "max_entry_mc_usd": 0 }
-    }
+    "1": { "name": "Preset 1", "buy_amount_sol": 0.01, ... },
+    "2": { ... },
+    "3": { ... }
   }
 }
 ```
 
----
+### `dashboard.html` (1015 lines)
 
-## What Already Works
+Single-page app served at `localhost:8765`. Features:
+- **Bot Control**: Start/Stop buttons, Auto Trading toggle, 🧪 Test Mode toggle (amber), Mode selector (Infinite/N trades), Max Concurrent Positions
+- **Test Mode Banner**: Yellow warning banner when `test_mode=true`
+- **Wallet**: Private key input (save to `.env`), public address display, SOL balance with refresh
+- **Presets 1-3**: Tabs with Entry fields (buy amount, fees, slippage, max retries), Filters (dev buy, ATH, migrations, TX count, lifetime, entry MC range), Trailing Stops, TP/SL rows
+- **Stats**: Tokens Found, Passed Filters, Buys Executed, Open Positions (with [Reset] button), 🧪 Test Mode Stats section (hidden until `test_buys_executed > 0`), 💰 Live Trading Stats section (hidden until `buys_executed > 0`)
+- Stats poll every 3 s via `/api/status`
+- Config changes debounce-save via `/api/config` (600 ms)
 
-| Feature | Status |
-|---|---|
-| Token detection (PumpPortal WS) | Working, default listener |
-| Token detection (logsSubscribe) | Working |
-| Token detection (blockSubscribe) | Working (requires paid RPC tier) |
-| Token detection (Geyser gRPC) | Code ready, needs Geyser endpoint |
-| Deduplication | `processed_mints` dict, 30-min window |
-| Mayhem-mode filter | Silent skip (no Telegram) |
-| Dev wallet check (age, balance, launches) | Via on-chain RPC |
-| GMGN dev history (last 5 tokens + ATH) | Via `gmgn-cli` subprocess |
-| On-chain BC dev-buy detection | Raw struct.unpack from account bytes |
-| Filter: min dev buy SOL | Done |
-| Filter: min ATH (any-1 or all-5 mode) | Done |
-| Filter: migrations count | Done |
-| Telegram alerts (pass + reject with reason) | HTML parse mode |
-| Auto-buy (PlatformAwareBuyer) | Enabled via `auto_trading` flag |
-| Position monitor (accountSubscribe WS) | Event-driven, ~50-200 ms latency |
-| Take-profit (multi-level, partial) | Done |
-| Stop-loss (multi-level, partial) | Done |
-| Trailing stop (activation → peak track → fire) | Done |
-| Sell Telegram notifications | With PnL% |
-| Dashboard (presets, stats, wallet) | Done |
-| Multi-platform: pump.fun + letsbonk.fun | Done |
-| Helius Staked TX (fast submission) | Via `HELIUS_STAKED_URL` |
-| Cashback-coin sell path (17 accounts) | See CLAUDE.md protocol notes |
-| Cleanup empty token accounts | `cleanup/manager.py` |
-| MC Range Entry Filter (min/max_entry_mc_usd) | Done — checked at buy moment via BC reserves + background SOL/USD price |
+### `src/monitoring/dev_checker.py`
 
----
+Fetches dev wallet info within 1.5 s timeout:
+- `getBalance` (lamports → SOL)
+- `getSignaturesForAddress(limit=1000)` → wallet age (oldest sig blockTime) + tx count
+- Batch `getTransaction` for last 10 sigs → parse `CreateEvent` binary (base64 `Program data:` log) → recent token mints
 
-## Current Status (as of last session — 2026-05-22)
+Returns `DevWalletInfo` with `timed_out=True` on timeout (scanner_runner rejects those tokens).
 
-- **auto_trading = false** — bot is in scan-only / alert mode, no real buys
-- **Active preset = 1** with `ath_require_all: true` and `min_ath_last5: 3000` — strict filter
-- **Stats snapshot**: 90 tokens found, 7 passed filters, 0 buys executed
-- **Geyser not configured** — `GEYSER_ENDPOINT` and `GEYSER_API_TOKEN` are empty in `.env`
+### `src/notifications/telegram_reporter.py`
+
+Sends HTML-formatted messages to Telegram via `sendMessage` API. 10 s timeout per request. Returns `True`/`False`. No retries (fire-and-forget).
+
+### `bots/bot-scanner-telegram.yaml`
+
+```yaml
+name: bot-scanner-telegram
+platform: pump_fun
+listener_type: logs
+wss_endpoint: ${SOLANA_NODE_WSS_ENDPOINT}
+rpc_endpoint: ${SOLANA_NODE_RPC_ENDPOINT}
+env_file: .env
+telegram:
+  bot_token: ${TELEGRAM_BOT_TOKEN}
+  chat_id: ${TELEGRAM_CHAT_ID}
+```
 
 ---
 
-## Known Issues / Notes
+## Multi-Position Mode
 
-1. **`gas_fee_sol` is unused** — present in `bot_config.json` and dashboard UI but `scanner_runner.py` never reads it. Transaction fees are controlled by `priority_fee_sol` only.
+The bot supports up to `max_concurrent_positions` simultaneous open positions (default 1).
 
-2. **Stale-mint cleanup comment wrong** — `scanner_runner.py` line ~583 says "5 minutes" but cutoff is `1800` s (30 min). Comment-only bug, behavior is fine.
+**Counter:** `open_positions` in `bot_config.json` (integer). Replaces the old `_position_active` boolean flag (removed).
 
-3. **No auth on dashboard server** — `bot_server.py` has no authentication. Anyone with localhost access can start/stop the bot or overwrite the private key via `/api/save-key`. Keep the server local-only.
+**Rules:**
+1. `open_pos >= max_concurrent` → complete silence (no Telegram, no data fetch, immediate return)
+2. `open_pos > 0` (any position open, below capacity) → suppress rejection alerts; send ✅ alerts and buy alerts normally
+3. `open_pos == 0` → all alerts sent
 
-4. **`ath_require_all: true` is very strict** — requires every one of the dev's last 5 tokens to have ATH >= threshold. This is why the pass rate is low (~8%). Consider `ath_require_all: false` or lowering `min_ath_last5` for more signals.
+**Race protection:** `_position_entry_lock` (asyncio.Lock) is held while reading config + incrementing `open_positions`. Both live and test gates use this same lock — they cannot interleave.
 
-5. **`gmgn-cli` dependency** — GMGN fetch uses `npx gmgn-cli` subprocess. If Node.js / npm cache is cold, first call can be slow. Requires `~/.config/gmgn/.env` with GMGN API key, not the project `.env`.
-
-6. **pump.fun IDL is incomplete** — see `CLAUDE.md` for full protocol notes. BC buy is 18 accounts, sell is 16/17 (cashback path). Do not rely on the IDL alone for account lists.
+**Stuck counter:** If bot crashes mid-trade, `open_positions` may stay > 0. Fixes:
+- Press Stop → Start (unconditionally resets to 0)
+- Click [Reset] button in dashboard (POST `/api/reset-positions`)
 
 ---
 
-## Running the Bot
+## Test Mode (Paper Trading)
+
+When `test_mode=True` in config:
+- After a token passes all filters, a simulated buy is created at current BC price × 1.15 (15% slippage simulation)
+- Simulated positions participate in `open_positions` counter — same capacity rules as live mode
+- `monitor_position_test` watches the BC address via `accountSubscribe`
+- On TP/SL/trail trigger: sends Telegram notification with simulated PnL (no on-chain tx)
+- On full close: writes `test_wins`/`test_losses`/`test_total_pnl_sol` to config
+- Stats shown in dashboard under 🧪 Test Mode Stats section
+
+Test mode is independent of `auto_trading`. Both can be on simultaneously (test simulates, live buys). They share the `open_positions` slot counter.
+
+---
+
+## Filters (Preset-level, re-read live per token)
+
+| Filter | Field | Default | Notes |
+|---|---|---|---|
+| Mayhem mode skip | (auto) | always | Silent skip, no Telegram |
+| Dev buy amount | `min_dev_buy_sol` | 0.1 | Skip if `< min`. Can disable with `dev_buy_check_enabled=false` |
+| ATH of last 5 tokens | `min_ath_last5` | 0 | 0 = disabled. `ath_require_all`: all 5 must pass vs any 1 |
+| Migrations in last 5 | `min_migrations_last5` | 0 | Token migrated = ATH ≥ $35,000 |
+| TX count range | `min_tx_count` / `max_tx_count` | 0 | 0 = disabled. `tx_count_require_all`: all 5 vs any 1 |
+| Token lifetime | `min_lifetime_minutes` | 0 | Minutes between create and last trade. `lifetime_require_all` |
+| Entry MC range | `min_entry_mc_usd` / `max_entry_mc_usd` | 0 | Checked via live BC read inside position lock gate |
+
+Rejection alerts are suppressed when any position is open (`open_pos > 0`).
+
+Data quality guards (dev timeout, GMGN fail, empty history, dev data missing) always reject with alert — unless `_any_position_open`.
+
+---
+
+## Exit Strategies (Position Monitor)
+
+All configured per-preset, re-read live from config on every price tick (live mode only; test mode uses snapshot):
+
+**Take Profits:** Up to 8 levels. Each: `price_pct` (% above entry to trigger) + `position_pct` (% of original tokens to sell). `position_pct` is % of the original buy amount, not current remaining.
+
+**Stop Losses:** Up to 3 levels. Each: `price_pct` (% below entry to trigger) + `position_pct`.
+
+**Trailing Stops:** Up to 3. Each: `activation_pct` (% above entry to arm) + `trail_size_pct` (% drop from peak to fire) + `position_pct`. Each trailing stop tracks its own peak independently.
+
+Moonbag = remaining tokens after all TP/trail fires (whatever % wasn't covered by exits).
+
+All sell tasks retry indefinitely (0.5 s between attempts) until on-chain confirmation. Fired flags set only after confirmed sell to prevent double-firing.
+
+---
+
+## Data Flow Timing
+
+Per-token latency breakdown:
+```
+Token detected (WS)
+  ↓ ~0 ms
+STEP 1: capacity check (sync read)
+  ↓ ~0 ms
+Parallel Phase 1:
+  - Dev wallet check (Helius getSignaturesForAddress + batch getTransaction) ~800-1200 ms
+  - GMGN HTTP API call ~200-400 ms
+  - BC dev-buy RPC (fires immediately, runs in background) ~300-500 ms
+  ↓ ~1300 ms (max of above)
+Filters 1-6 applied (sync, ~0 ms)
+  ↓
+Phase 2: await BC dev-buy result (usually already done, ~0 ms extra)
+  ↓
+Telegram alert sent + buy execution (async, non-blocking)
+```
+
+Total: ~1.3-1.5 s from token detection to buy dispatch (dominated by GMGN call).
+
+---
+
+## Environment Variables (`.env`)
+
+```
+SOLANA_PRIVATE_KEY=<base58>
+SOLANA_NODE_RPC_ENDPOINT=https://mainnet.helius-rpc.com/?api-key=...
+SOLANA_NODE_WSS_ENDPOINT=wss://mainnet.helius-rpc.com/?api-key=...
+HELIUS_STAKED_URL=https://staked.helius-rpc.com/?api-key=...
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+GMGN_API_KEY=...              # Optional; enables direct HTTP path (faster than CLI)
+```
+
+---
+
+## Running the System
 
 ```bash
-# Start dashboard (then open http://localhost:8765)
-python bot_server.py
+# Start dashboard server (keep running in a terminal)
+uv run bot_server.py
+# Dashboard at http://localhost:8765/
 
-# Or run scanner directly
+# Start bot manually (bot_server.py does this when you press Start)
 uv run src/scanner_runner.py bots/bot-scanner-telegram.yaml
 
-# Push changes to GitHub
-./push.sh
+# Check if bot is running
+pgrep -f scanner_runner.py
 ```
 
 ---
 
-## Important pump.fun Protocol Notes (summary)
+## Known Design Notes / Gotchas
 
-Full details in `CLAUDE.md`. Key gotchas:
-- BC v2 PDA seed: `["bonding-curve-v2", mint]` under pump program
-- BC `buy` = 18 accounts (post 2026-04-28), last account is one of 8 fee recipients
-- BC `sell` = 16 accounts (non-cashback) or 17 (cashback — inserts `user_volume_accumulator` before BC)
-- Cashback detection: byte 82 of BC account data, or `is_cashback_coin` on `TokenInfo`
-- BondingCurve account = 83 bytes; trailing bytes: `is_mayhem_mode`, `is_cashback_coin`
-- `extreme_fast_mode` skips RPC fetch — event parser must populate `is_mayhem_mode` and `is_cashback_coin` from `CreateEvent`
+1. **`open_pos` rollback value**: When the lock gate increments `open_positions` from N to N+1, `open_pos = N` is saved. All failure paths use `await _update_bot_config({"open_positions": max(0, open_pos)})` which writes N (the pre-increment value). This is correct — it rolls back the increment.
 
----
+2. **`_update_bot_config` stats merge**: The function does `cfg.setdefault("stats", {}).update(v)` for stats updates. This means stat values passed in are WRITTEN DIRECTLY, not incremented from current file. Callers compute the new value themselves before calling. This means two concurrent callers with the same stale read can lose an increment. For display counters (`tokens_found_today` etc.) this is acceptable; for position counters it's safe because the lock gate serializes access.
 
-## Session Update — 2026-05-22
+3. **`_spm_config_lock` vs `_config_lock`**: Different lock objects protecting the same file. Low collision risk in practice (stat writes are rare). Not fixed to avoid cross-module lock sharing.
 
-### Completed This Session
+4. **Dev buy RPC retry logic**: `_fetch_bc_dev_buy` retries when `vsol == INITIAL` (30 SOL) because the BC account may not yet reflect the dev buy. Up to 5 attempts × 250 ms = 1.25 s max. Since Phase 1 takes ~1.3 s, this runs concurrently and adds zero latency in the common case.
 
-- `accountSubscribe` WebSocket price monitoring (50–200 ms latency, zero polling)
-- All filter checks run in parallel via `asyncio.gather` (single flat gather, no nested wrappers)
-- Mayhem tokens: silent skip, no Telegram message
-- GMGN failure: token rejected, not passed through
-- Deduplication: 30-min window via `processed_mints` dict
-- Two Telegram message formats: short (failed + reason) and full (passed all filters)
-- ATH filter toggle: "any 1 of 5" vs "all 5" (`ath_require_all`)
-- Two-phase parallel fetch: GMGN + Helius start at **mint time** (not after dev buy arrives); dev buy check runs last after other filters pass (`task_bc_buy` as background `asyncio.Task`)
-- `dev_buy_check_enabled` toggle in dashboard Entry Filters — when OFF: dev buy shown in alert but not enforced as filter
-- TX count range filter (Filter 5): min/max tx count for dev's last 5 tokens, `tx_count_require_all` toggle
-- Token lifetime filter (Filter 6): min lifetime in minutes for dev's last 5 tokens, `lifetime_require_all` toggle
-- Both new filters use Helius `getSignaturesForAddress` (5 parallel calls, ~150 ms, chained after GMGN)
-- Trailing stop reworked: trail% now measured from **activation price** (not entry); supports up to 3 independent trailing stops in `trailing_stops` array; each tracks its own `peak` starting from activation
-- Dashboard: trailing stops replaced with multi-row list (+ Add button, up to 3); per-row hint shows calculated initial floor % from entry
-- `bot_config.json`: `trailing_stop` single object → `trailing_stops` array; backward compat kept in monitor
-- GitHub repo created: https://github.com/valentyn911/pumpfun-sniper-bot
+5. **Entry MC check inside lock gate**: `_check_entry_mc` is awaited AFTER `open_positions` was already incremented. If MC check fails, the counter is rolled back immediately with `await _update_bot_config({"open_positions": max(0, open_pos)})`.
 
-### Open Tasks (next session)
+6. **Test mode slippage simulation**: Entry price = `cur_price_test * 1.15` (15% worse than current BC price). This models realistic fill price for a new token.
 
-1. **Geyser listener** — fully implemented code-wise; needs non-empty `GEYSER_ENDPOINT` and `GEYSER_API_TOKEN` in `.env`, then switch `listener_type: geyser` in bot YAML for ~100 ms detection vs ~300 ms PumpPortal
+7. **`bot_mode` and `max_trades_count` read at startup only**: Mode and max-trades limit are read once when `run_scanner` starts. Changes while running take effect on next Start.
 
-2. **Sniper wallet analysis** — write `wallet_analysis.py` using Helius RPC for wallet `3ixtZXbbJjNEq89GbeFu8vJMGDMNSePofNEf5kecVhsA`:
-   - Always buys 1.27 SOL at MC ~$2.85–3.05K (pump.fun launch)
-   - Gets 35.8M or 38M tokens
-   - Exit: 2–6 sells, largest portion first at lowest TP
-   - Losses: always 2×50% sells, SL ~-8% on second half
-   - Winners: progressive ladder, trailing stop fires last ~13% on pullback
-   - Script should parse Helius transaction history and reconstruct entry/exit logic
+8. **`monitor_position` crash notification**: If the live position monitor crashes, it sends a Telegram alert warning the user that `open_positions` may need manual reset via the [Reset] button. The `finally` block still runs the decrement.
 
-3. **`HELIUS_GATEKEEPER_URL`** — added to `.env.example`; obtain from Helius dashboard and populate `.env` for gated RPC access
+9. **pump.fun BC account size**: 83 bytes. Fields at byte 8: `virtual_token_reserves (u64)`, byte 16: `virtual_sol_reserves (u64)`. Price = `(vsol / vtoken) * 1e6 / 1e9`. Trailing fields: `is_mayhem_mode (bool)` + `is_cashback_coin (bool)` at bytes 81-82.
 
-### Architecture Notes (current state)
+10. **Cashback sell account count**: Non-cashback sell = 16 accounts; cashback sell = 17 accounts (inserts `user_volume_accumulator` PDA before `bonding-curve-v2`). Detected from BC byte 82 or `is_cashback_coin` field set during buy.
 
-**Token processing flow (as implemented):**
-```
-Token minted → dev address known
-│
-├── task_bc_buy  (asyncio.Task, fires immediately)
-├── task_mint    (asyncio.Task, fires immediately)
-│
-└── Phase 1 await (4 s timeout):
-    ├── check_dev_wallet()        ~300 ms
-    └── _get_gmgn_dev_tokens()   ~1.3 s  ← bottleneck
-        └── Stream 4: getSignaturesForAddress ×5  ~150 ms (after GMGN)
-│
-Data guards → Filter 3 (ATH) → Filter 4 (Mig) → Filter 5 (TX) → Filter 6 (Lifetime)
-│
-└── Phase 2: await task_bc_buy (0.5 s cap, usually instant)
-    └── Filter 2 (dev buy) — last, only if dev_buy_check_enabled=true
-        └── ✅ ALL PASSED → Telegram + optional auto-buy
-```
-
-**Trailing stop formula (corrected):**
-- Activation price = `entry × (1 + activation_pct/100)`
-- At activation: `state["peak"] = current_price`
-- Fire when: `current_price ≤ state["peak"] × (1 − trail_size_pct/100)`
-- Initial floor: `activation_price × (1 − trail_size_pct/100)` = `entry × (1+act/100) × (1−trail/100)`
+11. **Blacklisted mints**: `BLACKLISTED_MINTS` frozenset in scanner_runner — silent skip, no Telegram. Currently contains one known garbage token.
 
 ---
 
-## Session Update — 2026-05-23
+## Recent Session Changes (2026-05-23 / 2026-05-24)
 
-### Completed This Session
+### Multi-position mode (Counter-based)
+- Removed `_position_active` boolean flag entirely from scanner_runner
+- Replaced with `open_positions` counter comparisons at start of `_check_and_notify`
+- `_position_entry_lock` retained for atomic increment
+- Both live and test paths participate in the counter (test positions count toward capacity)
 
-1. **Trailing stop verified production-ready** — trail measured from activation price (not entry), multiple independent stops with separate `peak` state, partial sells chain correctly. `trailing_stops` array (up to 3 entries) replaces old single `trailing_stop` object; backward compat kept in `scanner_position_monitor.py`.
+### Stats System
+- Added: `test_wins`, `test_losses`, `test_total_pnl_sol`, `real_wins`, `real_losses`, `real_total_pnl_sol`
+- `_update_test_stat` extended with `pnl_delta` parameter
+- `_update_live_stat` added to `scanner_position_monitor.py` (called on full position close)
+- Dashboard shows 🧪 Test Mode Stats and 💰 Live Trading Stats sections (hidden until `> 0` buys)
+- WR% and color-coded PnL displayed
 
-2. **`bot_config.json` / `DEFAULT_CONFIG` schema fix** — `bot_server.py` `DEFAULT_CONFIG` now uses `"trailing_stops": []` (array) instead of `"trailing_stop": {}` (single object).
+### Bug fixes
+- `/api/stop` unconditional reset (removed `if ok:` guard that caused stuck counter when bot crashed)
+- `/api/reset-positions` endpoint added + [Reset] button in dashboard
+- `statMaxPos.textContent` line removed (was destroying the span and causing TypeError that silently broke all downstream stats updates on every poll)
+- `_update_live_stat` unused `update_config` parameter removed
 
-3. **`fired` flag order fix in position monitor** — flag was set before the sell attempt, causing permanently skipped levels on failed transactions. Fixed to mark fired only after a successful sell.
-
-4. **Helius Staked URL** — confirmed used for both buy (`buyer_client`) and sell (`PlatformAwareSeller`). No change needed.
-
-5. **Dev buy amount bug fixed** — bot reported "11.292 SOL" instead of ~1 SOL. Root cause: `_fetch_bc_dev_buy()` read `virtual_sol_reserves` from the bonding-curve account ~500 ms after launch, by which time other snipers had already bought in, inflating the value. Fix: read `solAmount` directly from the PumpPortal event payload (exact SOL the dev spent in the create tx). New `dev_buy_sol` field added to `TokenInfo`; old RPC fallback preserved for non-PumpPortal listeners. Files changed: `pumpportal_processor.py`, `interfaces/core.py`, `scanner_runner.py`.
-
-6. **Market Cap Range entry filter** — `min_entry_mc_usd` / `max_entry_mc_usd` in filters (0 = disabled). Checked immediately before the buy transaction: reads BC reserves → price SOL/token × 1B supply × SOL/USD price. SOL/USD updated by background `_sol_price_updater()` task (Binance, every 30 s) — zero HTTP latency on the buy path. Added to dashboard Entry Filters section, all 3 presets, and `DEFAULT_CONFIG`.
-
-7. **Jito MEV tip** — `jito_tip_sol` field in all presets (default 0.003). SOL transfer to a random Jito tip account injected as the first instruction in every transaction (buy + sell). Wired through `core/client.py` → `PlatformAwareBuyer/Seller` → `scanner_position_monitor._sell()`. Dashboard Jito Tip field added between Priority Fee and Gas Fee.
-
-8. **Dev token history sort order fixed** — now newest launch first (descending by `create_timestamp`). Old code showed oldest first. Also fixed `[:5]` to be taken after sort so the 5 most recent tokens are always shown regardless of where the current token sits in GMGN's list.
-
-9. **GMGN history showing 1 token instead of 5 — investigated** — not a code bug. At SHIM's detection time GMGN only had 2 tokens for that dev (FCA + SHIM); the other 4 were launched 8–17 min later. Code was correct; sort fix ensures right tokens are selected when GMGN has them.
-
-10. **GMGN subprocess → direct HTTP API** — eliminated `npx gmgn-cli` subprocess overhead:
-    - Old: subprocess spawn + Node.js init + CLI = **~763 ms avg**
-    - New: `aiohttp` GET to `openapi.gmgn.ai` = **~265 ms avg**
-    - Savings: **~500 ms per token** (Phase1 bottleneck cut by 65%)
-    - Endpoint: `https://openapi.gmgn.ai/v1/user/created_tokens`
-    - Auth: `X-APIKEY` header + `timestamp` (unix sec) + `client_id` (UUID) query params
-    - Fallback: logs `[GMGN HTTP] ... fallback to CLI` and runs subprocess if API key missing or HTTP fails
-    - Total pipeline: **~390 ms avg** (was ~890 ms)
-
-### Real Latency Numbers (from logs — 6,923 tokens, PumpPortal listener, pre-HTTP-fix)
-
-| Stage | Avg | Min | Max |
-|---|---|---|---|
-| mint→GMGN + dev wallet complete | 763 ms | 614 ms | 3024 ms |
-| Stream4 (getSignaturesForAddress ×N) | 151 ms | 78 ms | 1506 ms |
-| mint→all filters done | 890 ms | 615 ms | 3025 ms |
-| filters→send (buy tx) | not yet measured — auto_trading=false |
-| send→confirm | not yet measured — auto_trading=false |
-
-After HTTP fix: GMGN avg drops from 763 ms → ~265 ms. Total pipeline: ~390 ms expected.
-
-`[TIMING]` log lines now emitted for all 4 buy-path stages; real numbers will appear once `auto_trading = true`.
-
-### Current Status
-
-- **auto_trading = false** — scan + alert only, no real buys executed
-- **All timing instrumented**: `[TIMING] mint→filters`, `filters→send`, `send→confirm`, `mint→confirm`
-
-### Open Tasks (next session)
-
-- Enable `auto_trading = true` with small amount (0.01 SOL) and monitor real buy timing logs
-- Verify Jito tip flow end-to-end in a real transaction (check explorer)
-- Consider Geyser integration for faster mint detection (~100 ms vs ~300 ms PumpPortal)
+### Dashboard
+- Test Mode toggle restored (amber, between Auto Trading and Mode selector)
+- Yellow test mode banner added
+- Open Positions card has [Reset] button (calls `/api/reset-positions`)

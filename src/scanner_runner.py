@@ -45,7 +45,7 @@ from platforms.pumpfun.address_provider import PumpFunAddresses
 from monitoring.dev_checker import DevWalletInfo, check_dev_wallet
 from monitoring.listener_factory import ListenerFactory
 from notifications.telegram_reporter import TelegramReporter
-from scanner_position_monitor import monitor_position
+from scanner_position_monitor import SimulatedPosition, monitor_position, monitor_position_test
 from trading.platform_aware import PlatformAwareBuyer
 from utils.logger import get_logger, setup_file_logging
 
@@ -177,6 +177,8 @@ def _now_ms() -> str:
 def _format_mc(mc: float | None) -> str:
     if mc is None or mc <= 0:
         return "—"
+    if mc < 100:
+        return f"${mc:.2f}"
     return f"${mc:,.0f}"
 
 
@@ -185,53 +187,73 @@ def _format_mc(mc: float | None) -> str:
 # ---------------------------------------------------------------------------
 
 _VIRTUAL_SOL_INITIAL = 30_000_000_000
+_PUMP_FUN_TOTAL_SUPPLY = 1_000_000_000
 
 
 async def _fetch_bc_dev_buy(bc_address: str, rpc: str) -> float | None:
+    """Read virtual_sol_reserves from BC account to compute dev buy amount.
+
+    Retries when vsol == INITIAL (30 SOL) since the RPC node may not yet have
+    propagated the dev buy state even though the transaction is confirmed.
+    Runs concurrently with Phase 1 (GMGN, ~1.3 s), so retries cost no latency.
     """
-    Получить virtual_sol_reserves из bonding curve аккаунта.
-    Возвращает SOL, потраченный девом при запуске (0.0 если не покупал).
-    """
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getAccountInfo",
-            "params": [bc_address, {"encoding": "base64", "commitment": "confirmed"}],
-        }
-        timeout = aiohttp.ClientTimeout(total=2.0)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            for attempt in range(2):
+    _MAX_ATTEMPTS = 5
+    _RETRY_DELAY_S = 0.25
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getAccountInfo",
+        "params": [bc_address, {"encoding": "base64", "commitment": "confirmed"}],
+    }
+
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            timeout = aiohttp.ClientTimeout(total=2.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(rpc, json=payload) as resp:
                     data = await resp.json()
-                value = data.get("result", {}).get("value")
-                if value is not None:
-                    break
-                if attempt == 0:
-                    await asyncio.sleep(0.3)
-            else:
+
+            value = data.get("result", {}).get("value")
+            if value is None:
+                logger.debug(f"[dev_buy] attempt {attempt+1}: account not found {bc_address[:8]}")
+                if attempt < _MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(_RETRY_DELAY_S)
+                continue
+
+            raw_data = value.get("data")
+            if not raw_data or not isinstance(raw_data, list):
+                logger.warning(f"[dev_buy] no data field in account: {bc_address[:8]}")
+                return None
+
+            account_bytes = base64.b64decode(raw_data[0])
+            if len(account_bytes) < 24:
                 logger.warning(
-                    f"[dev_buy] account not found after 2 attempts: {bc_address[:8]}"
+                    f"[dev_buy] account data too short ({len(account_bytes)}B): {bc_address[:8]}"
                 )
                 return None
 
-        raw_data = value.get("data")
-        if not raw_data or not isinstance(raw_data, list):
-            logger.warning(f"[dev_buy] no data field in account: {bc_address[:8]}")
-            return None
-        account_bytes = base64.b64decode(raw_data[0])
-        if len(account_bytes) < 24:
-            logger.warning(
-                f"[dev_buy] account data too short ({len(account_bytes)} bytes): {bc_address[:8]}"
+            vsol = struct.unpack_from("<Q", account_bytes, 16)[0]
+            dev_buy = max(0.0, (vsol - _VIRTUAL_SOL_INITIAL) / 1_000_000_000)
+            logger.info(
+                f"[DEV_BUY] _fetch_bc_dev_buy attempt {attempt+1}: vsol={vsol} → {dev_buy:.4f} SOL"
             )
-            return None
 
-        vsol = struct.unpack_from("<Q", account_bytes, 16)[0]
-        return max(0.0, (vsol - _VIRTUAL_SOL_INITIAL) / 1_000_000_000)
+            if dev_buy > 0.0 or attempt == _MAX_ATTEMPTS - 1:
+                return dev_buy
 
-    except Exception as e:
-        logger.warning(f"[dev_buy] RPC fetch failed for {bc_address[:8]}: {e}")
-        return None
+            # vsol == INITIAL: may be reading stale pre-dev-buy state, retry
+            logger.debug(
+                f"[dev_buy] attempt {attempt+1}: vsol=INITIAL, retrying in {_RETRY_DELAY_S}s"
+            )
+            await asyncio.sleep(_RETRY_DELAY_S)
+
+        except Exception as e:
+            logger.warning(f"[dev_buy] attempt {attempt+1} failed for {bc_address[:8]}: {e}")
+            if attempt < _MAX_ATTEMPTS - 1:
+                await asyncio.sleep(_RETRY_DELAY_S)
+
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +261,7 @@ async def _fetch_bc_dev_buy(bc_address: str, rpc: str) -> float | None:
 # ---------------------------------------------------------------------------
 
 _sol_price_usd: float = 0.0
+_position_entry_lock: asyncio.Lock = asyncio.Lock()
 
 
 async def _sol_price_updater() -> None:
@@ -259,35 +282,90 @@ async def _sol_price_updater() -> None:
 
 
 async def _get_current_token_price_sol(bc_address: str, rpc: str) -> float | None:
-    """Read bonding-curve reserves and return current price in SOL/token."""
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getAccountInfo",
-            "params": [bc_address, {"encoding": "base64", "commitment": "confirmed"}],
-        }
-        timeout = aiohttp.ClientTimeout(total=2.0)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(rpc, json=payload) as resp:
-                data = await resp.json()
-        value = data.get("result", {}).get("value")
-        if not value:
-            return None
-        raw_data = value.get("data")
-        if not raw_data or not isinstance(raw_data, list):
-            return None
-        account_bytes = base64.b64decode(raw_data[0])
-        if len(account_bytes) < 24:
-            return None
-        vtoken = struct.unpack_from("<Q", account_bytes, 8)[0]
-        vsol = struct.unpack_from("<Q", account_bytes, 16)[0]
-        if vtoken <= 0 or vsol <= 0:
-            return None
-        # price in SOL per full token (6 decimals)
-        return (vsol / vtoken) * (10**6) / 1_000_000_000
-    except Exception:
-        return None
+    """Read bonding-curve reserves and return current price in SOL per whole token.
+
+    Retries when the BC account looks like it's in initial (pre-dev-buy) state,
+    using the same backoff pattern as _fetch_bc_dev_buy.
+    Runs concurrently with Phase 1 (GMGN ~1.3 s) so retries cost zero latency.
+    """
+    _MAX_ATTEMPTS = 5
+    _RETRY_DELAY_S = 0.25
+    # Below this MC estimate the account is likely wrong / corrupted / not yet
+    # created. Real pump.fun initial MC is ~$1,400-$5,600 at SOL $50-$200,
+    # so $500 is safely below any legitimate reading. The $388 bug case gives
+    # mc_estimate ≈ $337 (pre-slippage), which falls below this floor.
+    _MC_STALE_THRESHOLD_USD = 500.0
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getAccountInfo",
+        "params": [bc_address, {"encoding": "base64", "commitment": "confirmed"}],
+    }
+
+    last_price: float | None = None
+
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            timeout = aiohttp.ClientTimeout(total=2.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(rpc, json=payload) as resp:
+                    data = await resp.json()
+
+            value = data.get("result", {}).get("value")
+            if not value:
+                logger.debug(
+                    f"[MC_FIX] attempt {attempt+1}: BC account not found {bc_address[:8]}"
+                )
+                if attempt < _MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(_RETRY_DELAY_S)
+                continue
+
+            raw_data = value.get("data")
+            if not raw_data or not isinstance(raw_data, list):
+                return None
+
+            account_bytes = base64.b64decode(raw_data[0])
+            if len(account_bytes) < 24:
+                return None
+
+            vtoken = struct.unpack_from("<Q", account_bytes, 8)[0]
+            vsol = struct.unpack_from("<Q", account_bytes, 16)[0]
+            if vtoken <= 0 or vsol <= 0:
+                if attempt < _MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(_RETRY_DELAY_S)
+                continue
+
+            # price in SOL per full token (6 decimals)
+            price = (vsol / vtoken) * (10**6) / 1_000_000_000
+            last_price = price
+
+            mc_estimate = price * _PUMP_FUN_TOTAL_SUPPLY * _sol_price_usd
+            logger.info(
+                f"[MC_FIX] attempt {attempt+1}: vsol={vsol}, vtoken={vtoken}, "
+                f"mc_estimate=${mc_estimate:.0f}"
+            )
+
+            if _sol_price_usd > 0 and mc_estimate <= _MC_STALE_THRESHOLD_USD:
+                # BC is in initial / pre-dev-buy state — retry
+                logger.debug(
+                    f"[MC_FIX] attempt {attempt+1}: mc=${mc_estimate:.0f} <= "
+                    f"${_MC_STALE_THRESHOLD_USD:.0f} threshold, retrying"
+                )
+                if attempt < _MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(_RETRY_DELAY_S)
+                continue
+
+            return price
+
+        except Exception as e:
+            logger.debug(f"[MC_FIX] attempt {attempt+1} failed for {bc_address[:8]}: {e}")
+            if attempt < _MAX_ATTEMPTS - 1:
+                await asyncio.sleep(_RETRY_DELAY_S)
+
+    # Return last read value even if below threshold (avoids silently dropping
+    # tokens whose genuine MC is near the floor)
+    return last_price
 
 
 async def _check_entry_mc(
@@ -445,7 +523,7 @@ def _parse_gmgn_tokens(
     return histories
 
 
-async def _get_gmgn_dev_tokens(dev_wallet: str, current_mint: str = "") -> list[TokenHistory]:
+async def _get_gmgn_dev_tokens(dev_wallet: str, current_mint: str = "") -> tuple[list[TokenHistory], str | None]:
     """Fetch tokens created by dev wallet.
 
     Primary path: direct GMGN OpenAPI HTTP call (~200 ms, zero subprocess overhead).
@@ -487,7 +565,13 @@ async def _get_gmgn_dev_tokens(dev_wallet: str, current_mint: str = "") -> list[
                 raise RuntimeError(f"API code={payload.get('code')} msg={payload.get('message')}")
 
             raw_tokens = (payload.get("data") or {}).get("tokens") or []
-            return _parse_gmgn_tokens(raw_tokens, current_mint)
+            total_field = (payload.get("data") or {}).get("total")
+            logger.debug(f"[GMGN HTTP] {label}... total={total_field}, page_size={len(raw_tokens)}")
+            if isinstance(total_field, int) and total_field > 0:
+                gmgn_total: str = str(total_field)
+            else:
+                gmgn_total = f"{len(raw_tokens)}+" if raw_tokens else "0"
+            return _parse_gmgn_tokens(raw_tokens, current_mint), gmgn_total
 
         except Exception as exc:
             logger.warning(f"[GMGN HTTP] {label}... failed ({exc}), fallback to CLI")
@@ -529,7 +613,13 @@ async def _get_gmgn_dev_tokens(dev_wallet: str, current_mint: str = "") -> list[
     except json.JSONDecodeError as e:
         raise RuntimeError(f"gmgn-cli invalid JSON: {e}") from e
 
-    return _parse_gmgn_tokens(data.get("tokens", []), current_mint)
+    raw_tokens_cli = data.get("tokens", [])
+    total_field_cli = data.get("total")
+    if isinstance(total_field_cli, int) and total_field_cli > 0:
+        gmgn_total_cli: str = str(total_field_cli)
+    else:
+        gmgn_total_cli = f"{len(raw_tokens_cli)}+" if raw_tokens_cli else "0"
+    return _parse_gmgn_tokens(raw_tokens_cli, current_mint), gmgn_total_cli
 
 
 # ---------------------------------------------------------------------------
@@ -543,13 +633,14 @@ def format_token_alert(
     dev: DevWalletInfo | None = None,
     dev_buy_sol: float | None = None,
     token_history: list[TokenHistory] | None = None,
+    gmgn_total: str | None = None,
 ) -> str:
     mint_str = str(token_info.mint)
     creator = token_info.creator or token_info.user
     creator_str = str(creator) if creator else "неизвестен"
 
     if token_info.platform == Platform.PUMP_FUN:
-        token_url = f"https://pump.fun/{mint_str}"
+        token_url = f"https://gmgn.ai/sol/token/{mint_str}"
     else:
         token_url = f"https://letsbonk.fun/token/{mint_str}"
 
@@ -569,11 +660,12 @@ def format_token_alert(
     else:
         bal = f"{dev.sol_balance:.3f} SOL" if dev.sol_balance is not None else "—"
         age = dev.wallet_age_str or "—"
-        launches = (
-            f"{dev.total_launches}+" if dev.launches_truncated and dev.total_launches
-            else str(dev.total_launches) if dev.total_launches is not None
-            else "—"
-        )
+        if gmgn_total is not None:
+            launches = gmgn_total
+        elif dev.total_launches is not None:
+            launches = f"{dev.total_launches}+" if dev.launches_truncated else str(dev.total_launches)
+        else:
+            launches = "—"
 
     lines = [
         f"⚡ ПРОВЕРКА #{count}",
@@ -731,6 +823,7 @@ async def run_scanner(config_path: str) -> None:
                 amount=buy_amount_sol,
                 slippage=buy_slippage,
                 max_retries=1,
+                extreme_fast_mode=True,
             )
             logger.info(
                 f"Покупатель инициализирован: {buy_amount_sol} SOL, "
@@ -776,6 +869,16 @@ async def run_scanner(config_path: str) -> None:
     if creator_address:
         logger.info(f"Фильтр по кошельку разработчика: {creator_address}")
 
+    # -----------------------------------------------------------------------
+    # N-trades mode: read mode/max_trades from bot_config.json at startup
+    # -----------------------------------------------------------------------
+    _initial_cfg = _read_bot_config() or {}
+    bot_mode: str = str(_initial_cfg.get("mode", "infinite"))
+    max_trades_count: int = int(_initial_cfg.get("max_trades", 10))
+    successful_buys_this_session: int = 0
+    _stop_scanning: bool = False
+    logger.info(f"Mode: {bot_mode} | Max trades: {max_trades_count}")
+
     token_count = 0
 
     # -----------------------------------------------------------------------
@@ -801,6 +904,10 @@ async def run_scanner(config_path: str) -> None:
 
     async def on_new_token(token_info: TokenInfo) -> None:
         nonlocal token_count
+
+        # N-trades mode: stop dispatching new tokens when limit reached
+        if _stop_scanning:
+            return
 
         mint_str = str(token_info.mint)
 
@@ -835,6 +942,20 @@ async def run_scanner(config_path: str) -> None:
         rpc: str,
         tg: TelegramReporter,
     ) -> None:
+        nonlocal successful_buys_this_session, _stop_scanning
+
+        # STEP 1: Capacity check — must be first, before ANY data fetch or Telegram output
+        _cap_cfg = _read_bot_config() or {}
+        _open_pos_cap = int(_cap_cfg.get("open_positions", 0))
+        _max_concurrent_cap = int(_cap_cfg.get("max_concurrent_positions", 1))
+        _any_position_open = _open_pos_cap > 0
+        _at_capacity = _open_pos_cap >= _max_concurrent_cap
+        if _at_capacity:
+            logger.debug(
+                f"[SILENT] {token_info.mint} — at capacity ({_open_pos_cap}/{_max_concurrent_cap}), skipping"
+            )
+            return
+
         t_total = time.perf_counter()
         creator = token_info.creator or token_info.user
         creator_str = str(creator) if creator else ""
@@ -846,8 +967,24 @@ async def run_scanner(config_path: str) -> None:
 
         bc_str = str(token_info.bonding_curve) if token_info.bonding_curve else None
 
+        # Extract dev_buy from CreateEvent virtual_sol_reserves (zero-cost, no RPC).
+        # NOTE: CreateEvent fires at BC initialization (pre-dev-buy), so vsr == 30e9 is
+        # the normal initial state — do NOT set dev_buy_sol=0.0 in that case, because that
+        # would prevent the RPC fallback from running. Only set from event when vsr > 30e9.
+        logger.info(
+            f"[DEV_BUY] virtual_sol_reserves={token_info.virtual_sol_reserves} "
+            f"dev_buy_sol(pre)={token_info.dev_buy_sol}"
+        )
+        if token_info.dev_buy_sol is None and token_info.virtual_sol_reserves is not None:
+            vsr = token_info.virtual_sol_reserves
+            if isinstance(vsr, int) and vsr > _VIRTUAL_SOL_INITIAL:
+                token_info.dev_buy_sol = (vsr - _VIRTUAL_SOL_INITIAL) / 1_000_000_000
+                logger.info(f"[DEV_BUY] set from event: {token_info.dev_buy_sol:.4f} SOL")
+            # else: vsr == INITIAL (pre-dev-buy) or unexpected type — leave as None
+            # so _fetch_bc_dev_buy RPC fallback runs
+
         if token_info.platform == Platform.PUMP_FUN:
-            token_url = f"https://pump.fun/{mint_str}"
+            token_url = f"https://gmgn.ai/sol/token/{mint_str}"
         else:
             token_url = f"https://letsbonk.fun/token/{mint_str}"
 
@@ -897,6 +1034,7 @@ async def run_scanner(config_path: str) -> None:
             or int(_pre_filt.get("max_tx_count", 0)) > 0
             or float(_pre_filt.get("min_lifetime_minutes", 0)) > 0
         )
+        _dev_buy_check: bool = bool(_pre_filt.get("dev_buy_check_enabled", True))
 
         # -------------------------------------------------------------------
         # Data fetch — all four tasks fire immediately in parallel at mint time.
@@ -906,13 +1044,17 @@ async def run_scanner(config_path: str) -> None:
         # Net result: total latency = max(GMGN, dev_buy) → not GMGN + dev_buy.
         # -------------------------------------------------------------------
         t_fetch = time.perf_counter()
-        # If the listener already provided dev_buy_sol (e.g. PumpPortal solAmount),
-        # skip the BC account RPC call — reading virtual_sol_reserves at this point
-        # would include other snipers' buys that happened in the ~500 ms since creation.
+        # If the listener already provided dev_buy_sol (e.g. from event when vsr > 30e9),
+        # skip the BC account RPC call. Also skip when dev_buy_check_enabled=False to avoid
+        # a latency-free wasted RPC call.
         task_bc_buy: asyncio.Task = asyncio.create_task(
             asyncio.sleep(0, result=token_info.dev_buy_sol)
             if token_info.dev_buy_sol is not None
-            else (_fetch_bc_dev_buy(bc_str, rpc) if (bc_str and rpc) else asyncio.sleep(0, result=None))
+            else (
+                _fetch_bc_dev_buy(bc_str, rpc)
+                if (bc_str and rpc and _dev_buy_check)
+                else asyncio.sleep(0, result=None)
+            )
         )
         task_mint: asyncio.Task = asyncio.create_task(
             _check_mint_freeze(mint_str, rpc) if rpc
@@ -924,6 +1066,7 @@ async def run_scanner(config_path: str) -> None:
         has_mint = has_freeze = False
         histories: list[TokenHistory] = []
         gmgn_failed = False
+        gmgn_total_launches: str | None = None
         sig_data: dict[str, tuple[int, int | None]] = {}
         phase1_ok = False
 
@@ -934,7 +1077,7 @@ async def run_scanner(config_path: str) -> None:
                     check_dev_wallet(creator_str, rpc) if (creator_str and rpc)
                     else asyncio.sleep(0, result=DevWalletInfo(address=creator_str or "")),
                     _get_gmgn_dev_tokens(creator_str, current_mint=mint_str) if creator_str
-                    else asyncio.sleep(0, result=[]),
+                    else asyncio.sleep(0, result=([], None)),
                     return_exceptions=True,
                 ),
                 timeout=4.0,
@@ -953,7 +1096,11 @@ async def run_scanner(config_path: str) -> None:
                 logger.warning(f"[#{count}] GMGN fetch failed for {mint_str[:8]}: {gmgn_r}")
                 histories = []
             else:
-                histories = gmgn_r if isinstance(gmgn_r, list) else []
+                if isinstance(gmgn_r, tuple):
+                    histories, gmgn_total_launches = gmgn_r
+                    histories = histories or []
+                else:
+                    histories = []
 
             logger.info(
                 f"[#{count}] Phase1 (dev+GMGN): {(time.perf_counter()-t_fetch)*1000:.0f}ms"
@@ -999,17 +1146,20 @@ async def run_scanner(config_path: str) -> None:
         # -------------------------------------------------------------------
         if dev.timed_out:
             logger.info(f"[#{count}] Data fetch timed out — rejecting")
-            await tg.send_message(_reject("data fetch timeout"))
+            if not _any_position_open:
+                await tg.send_message(_reject("data fetch timeout"))
             return
 
         if gmgn_failed:
             logger.info(f"[#{count}] GMGN unavailable — rejecting")
-            await tg.send_message(_reject("GMGN data unavailable"))
+            if not _any_position_open:
+                await tg.send_message(_reject("GMGN data unavailable"))
             return
 
         if not histories:
             logger.info(f"[#{count}] GMGN returned no token history — rejecting")
-            await tg.send_message(_reject("GMGN: no token history for this dev"))
+            if not _any_position_open:
+                await tg.send_message(_reject("GMGN: no token history for this dev"))
             return
 
         dev_data_missing = (
@@ -1019,7 +1169,8 @@ async def run_scanner(config_path: str) -> None:
         )
         if dev_data_missing or dev.error:
             logger.info(f"[#{count}] Dev wallet data missing — rejecting")
-            await tg.send_message(_reject("dev data unavailable"))
+            if not _any_position_open:
+                await tg.send_message(_reject("dev data unavailable"))
             return
 
         min_ath = float(filt.get("min_ath_last5", 0))
@@ -1039,9 +1190,10 @@ async def run_scanner(config_path: str) -> None:
                         f"[#{count}] Filter: {len(failing)}/{len(histories)} tokens below "
                         f"ATH {min_ath:.0f} → skip"
                     )
-                    await tg.send_message(_reject(
-                        f"ATH: {len(failing)} of {len(histories)} tokens below {_format_mc(min_ath)}"
-                    ))
+                    if not _any_position_open:
+                        await tg.send_message(_reject(
+                            f"ATH: {len(failing)} of {len(histories)} tokens below {_format_mc(min_ath)}"
+                        ))
                     return
             else:
                 best_ath = max((h.ath_market_cap or 0.0) for h in histories)
@@ -1049,9 +1201,10 @@ async def run_scanner(config_path: str) -> None:
                     logger.info(
                         f"[#{count}] Filter: best ATH {best_ath:.0f} < {min_ath:.0f} → skip"
                     )
-                    await tg.send_message(_reject(
-                        f"ATH {_format_mc(best_ath)} best of 5 (min {_format_mc(min_ath)})"
-                    ))
+                    if not _any_position_open:
+                        await tg.send_message(_reject(
+                            f"ATH {_format_mc(best_ath)} best of 5 (min {_format_mc(min_ath)})"
+                        ))
                     return
 
         # -------------------------------------------------------------------
@@ -1063,9 +1216,10 @@ async def run_scanner(config_path: str) -> None:
                 logger.info(
                     f"[#{count}] Filter: migrations {mig_count} < {min_mig} → skip"
                 )
-                await tg.send_message(_reject(
-                    f"Migrations {mig_count}/{len(histories)} (min {min_mig})"
-                ))
+                if not _any_position_open:
+                    await tg.send_message(_reject(
+                        f"Migrations {mig_count}/{len(histories)} (min {min_mig})"
+                    ))
                 return
 
         # -------------------------------------------------------------------
@@ -1099,9 +1253,10 @@ async def run_scanner(config_path: str) -> None:
                         f"[#{count}] Filter: tx count {cnt0} out of range "
                         f"{_tx_range_str()} for {h0.name} → skip"
                     )
-                    await tg.send_message(_reject(
-                        f"TX count {cnt0} (range {_tx_range_str()}) for {h0.name}"
-                    ))
+                    if not _any_position_open:
+                        await tg.send_message(_reject(
+                            f"TX count {cnt0} (range {_tx_range_str()}) for {h0.name}"
+                        ))
                     return
             else:
                 if not any(_tx_ok(h) for h in histories):
@@ -1110,9 +1265,10 @@ async def run_scanner(config_path: str) -> None:
                         f"[#{count}] Filter: no token in tx range "
                         f"{_tx_range_str()}, counts={counts} → skip"
                     )
-                    await tg.send_message(_reject(
-                        f"TX count {counts} (range {_tx_range_str()}), none passed"
-                    ))
+                    if not _any_position_open:
+                        await tg.send_message(_reject(
+                            f"TX count {counts} (range {_tx_range_str()}), none passed"
+                        ))
                     return
 
         # -------------------------------------------------------------------
@@ -1142,9 +1298,10 @@ async def run_scanner(config_path: str) -> None:
                         f"[#{count}] Filter: lifetime {lt_str}min < "
                         f"{min_lifetime:.1f}min for {h0.name} → skip"
                     )
-                    await tg.send_message(_reject(
-                        f"Token lifetime {lt_str} min (min {min_lifetime:.1f} min) for {h0.name}"
-                    ))
+                    if not _any_position_open:
+                        await tg.send_message(_reject(
+                            f"Token lifetime {lt_str} min (min {min_lifetime:.1f} min) for {h0.name}"
+                        ))
                     return
             else:
                 if not any(_lifetime_ok(h) for h in histories):
@@ -1156,9 +1313,10 @@ async def run_scanner(config_path: str) -> None:
                         f"[#{count}] Filter: no token with lifetime >= "
                         f"{min_lifetime:.1f}min, values={lt_strs} → skip"
                     )
-                    await tg.send_message(_reject(
-                        f"Token lifetimes {lt_strs} min (min {min_lifetime:.1f} min), none passed"
-                    ))
+                    if not _any_position_open:
+                        await tg.send_message(_reject(
+                            f"Token lifetimes {lt_strs} min (min {min_lifetime:.1f} min), none passed"
+                        ))
                     return
 
         # -------------------------------------------------------------------
@@ -1210,9 +1368,10 @@ async def run_scanner(config_path: str) -> None:
                 logger.info(
                     f"[#{count}] Filter: dev bought {dev_buy_sol:.3f} SOL < {min_dev_buy} → skip"
                 )
-                await tg.send_message(_reject(
-                    f"Dev buy {dev_buy_sol:.3f} SOL (min {min_dev_buy:.3f} SOL)"
-                ))
+                if not _any_position_open:
+                    await tg.send_message(_reject(
+                        f"Dev buy {dev_buy_sol:.3f} SOL (min {min_dev_buy:.3f} SOL)"
+                    ))
                 return
 
         # -------------------------------------------------------------------
@@ -1231,7 +1390,7 @@ async def run_scanner(config_path: str) -> None:
         # Build the full message with a ✅ header
         full_message = (
             "✅ ПРОШЁЛ ВСЕ ФИЛЬТРЫ\n"
-            + format_token_alert(token_info, count, dev, dev_buy_sol, histories)
+            + format_token_alert(token_info, count, dev, dev_buy_sol, histories, gmgn_total=gmgn_total_launches)
         )
 
         # Auto-buy block
@@ -1247,9 +1406,9 @@ async def run_scanner(config_path: str) -> None:
             open_pos = int((bot_cfg or {}).get("open_positions", 0))
             if open_pos >= max_pos:
                 logger.info(
-                    f"[#{count}] Position limit: {open_pos}/{max_pos} → skip buy"
+                    f"[#{count}] At capacity ({open_pos}/{max_pos}) when reaching buy — silent drop"
                 )
-                buy_block = f"\n\n⏸ Лимит позиций: {open_pos}/{max_pos}"
+                return
             else:
                 cur_buy_amount = float(preset.get("buy_amount_sol", buy_amount_sol))
                 cur_slippage = float(preset.get("buy_slippage", buy_slippage * 100)) / 100
@@ -1276,16 +1435,31 @@ async def run_scanner(config_path: str) -> None:
                     slippage=cur_slippage,
                     max_retries=int(preset.get("max_retries", 1)),
                     jito_tip_lamports=cur_jito_tip_ul,
+                    extreme_fast_mode=True,
                 )
+
+                # Atomic gate: claim position slot before any awaits
+                async with _position_entry_lock:
+                    _gate_cfg = _read_bot_config() or {}
+                    _gate_open = int(_gate_cfg.get("open_positions", 0))
+                    _gate_max = int(_gate_cfg.get("max_concurrent_positions", 1))
+                    if _gate_open >= _gate_max:
+                        logger.info(
+                            f"[#{count}] [GATE] Race: position limit {_gate_open}/{_gate_max} already consumed, skip"
+                        )
+                        return
+                    if _stop_scanning:
+                        return
+                    await _update_bot_config({"open_positions": _gate_open + 1})
+                    open_pos = _gate_open  # snapshot before increment, for failure path decrement
 
                 mc_passes, mc_skip_msg = await _check_entry_mc(
                     filt, bc_str, rpc, f"#{count}"
                 )
                 if not mc_passes:
+                    await _update_bot_config({"open_positions": max(0, open_pos)})
                     buy_block = mc_skip_msg
                 else:
-                    await _update_bot_config({"open_positions": open_pos + 1})
-
                     t_send = time.perf_counter()
                     logger.info(
                         f"[#{count}] [TIMING] filters→send: {(t_send - t_filters_passed) * 1000:.0f}ms"
@@ -1299,9 +1473,6 @@ async def run_scanner(config_path: str) -> None:
                                 f"[#{count}] [TIMING] send→confirm: {(t_confirm - t_send) * 1000:.0f}ms"
                                 f" | mint→confirm: {(t_confirm - t_total) * 1000:.0f}ms"
                             )
-                            buy_block = (
-                                f"\n✅ КУПЛЕНО: {cur_buy_amount:.4f} SOL | Fee: {cur_priority_sol:.4f} SOL"
-                            )
                             logger.info(f"[#{count}] Buy success: {buy_result.tx_signature}")
                             await _update_bot_config({
                                 "stats": {
@@ -1310,6 +1481,64 @@ async def run_scanner(config_path: str) -> None:
                                     )
                                 }
                             })
+
+                            # N-trades mode: increment counter and check limit
+                            successful_buys_this_session += 1
+                            if bot_mode == "n" and successful_buys_this_session >= max_trades_count:
+                                _stop_scanning = True
+                                asyncio.create_task(tg.send_message(
+                                    f"✅ <b>Лимит торгов достигнут!</b>\n"
+                                    f"🎯 Выполнено {successful_buys_this_session}/{max_trades_count} покупок.\n"
+                                    f"🔴 Новые токены больше не обрабатываются."
+                                ))
+
+                            # Build rich BUY alert
+                            entry_p = buy_result.price or 0.0
+                            entry_tokens = buy_result.amount or 0.0
+                            entry_sol_spent = entry_p * entry_tokens
+                            gas_fee_sol = float(preset.get("gas_fee_sol", 0.00005))
+                            total_fees_sol = cur_priority_sol + cur_jito_tip_sol + gas_fee_sol
+                            total_out_sol = entry_sol_spent + total_fees_sol
+                            sol_usd = _sol_price_usd
+
+                            mc_at_entry = entry_p * 1_000_000_000 * sol_usd if sol_usd > 0 and entry_p > 0 else None
+                            tx_sig_str = str(buy_result.tx_signature) if buy_result.tx_signature else None
+                            tx_url = f"https://solscan.io/tx/{tx_sig_str}" if tx_sig_str else ""
+
+                            exit_lines: list[str] = []
+                            for i, tp in enumerate(preset.get("take_profits", []), 1):
+                                exit_lines.append(
+                                    f"  TP{i}: +{tp['price_pct']:.0f}% → {tp['position_pct']:.0f}% позиции"
+                                )
+                            for i, sl in enumerate(preset.get("stop_losses", []), 1):
+                                exit_lines.append(
+                                    f"  SL{i}: -{sl['price_pct']:.0f}% → {sl['position_pct']:.0f}% позиции"
+                                )
+                            ts_list = list(preset.get("trailing_stops") or [])
+                            if not ts_list and preset.get("trailing_stop", {}).get("enabled"):
+                                ts_list = [preset["trailing_stop"]]
+                            for i, ts in enumerate(ts_list, 1):
+                                if ts.get("enabled", True):
+                                    exit_lines.append(
+                                        f"  Trail{i}: act +{ts['activation_pct']:.0f}% | trail -{ts['trail_size_pct']:.0f}% | {ts['position_pct']:.0f}%"
+                                    )
+
+                            buy_lines = [
+                                "\n✅ <b>КУПЛЕНО</b>",
+                                f"💰 Вложено: {entry_sol_spent:.6f} SOL" + (f" (${entry_sol_spent * sol_usd:.2f})" if sol_usd > 0 else "") + f" → {entry_tokens:.4f} токенов",
+                                f"📊 MC входа: {_format_mc(mc_at_entry)}",
+                            ]
+                            buy_lines += [
+                                f"💸 Комиссии: priority {cur_priority_sol:.5f} + jito {cur_jito_tip_sol:.5f} + gas {gas_fee_sol:.5f} = {total_fees_sol:.5f} SOL" + (f" (${total_fees_sol * sol_usd:.3f})" if sol_usd > 0 else ""),
+                                f"💼 Итого: {total_out_sol:.6f} SOL" + (f" (${total_out_sol * sol_usd:.2f})" if sol_usd > 0 else ""),
+                            ]
+                            if exit_lines:
+                                buy_lines.append("📈 Стратегия выхода:")
+                                buy_lines.extend(exit_lines)
+                            if tx_url:
+                                buy_lines.append(f"🔗 <a href='{tx_url}'>Solscan TX</a>")
+                            buy_block = "\n".join(buy_lines)
+
                             if (
                                 buy_result.amount is not None
                                 and buy_result.price is not None
@@ -1327,25 +1556,211 @@ async def run_scanner(config_path: str) -> None:
                                         preset_id=active_preset_id,
                                         priority_fee_microlamports=cur_priority_ul,
                                         notify_fn=tg.send_message,
+                                        entry_time=time.monotonic(),
+                                        sol_price_getter=lambda: _sol_price_usd,
+                                        position_close_fn=None,
                                     )
                                 )
+                            else:
+                                # Buy returned success=True but no amount/price — release slot
+                                await _update_bot_config({"open_positions": max(0, open_pos)})
                         else:
                             err = _escape_html(buy_result.error_message or "unknown error")
                             buy_block = f"\n\n❌ Покупка не удалась: {err}"
                             logger.warning(f"[#{count}] Buy failed: {buy_result.error_message}")
-                            cur_cfg = _read_bot_config() or {}
-                            await _update_bot_config({"open_positions": max(0, cur_cfg.get("open_positions", 1) - 1)})
+                            await _update_bot_config({"open_positions": max(0, open_pos)})
                     except Exception as e:
                         buy_block = f"\n\n❌ Покупка не удалась: {_escape_html(str(e))}"
                         logger.error(f"[#{count}] Buy exception: {e}")
-                        cur_cfg = _read_bot_config() or {}
-                        await _update_bot_config({"open_positions": max(0, cur_cfg.get("open_positions", 1) - 1)})
+                        await _update_bot_config({"open_positions": max(0, open_pos)})
 
         full_message += buy_block
         success = await tg.send_message(full_message)
 
         if not success:
             logger.warning(f"[#{count}] Failed to send Telegram notification")
+
+        # -------------------------------------------------------------------
+        # TEST MODE: paper-trade simulation (independent of auto_trading)
+        # Shares successful_buys_this_session with real buys for N-trades limit.
+        # Participates in open_positions counter (same capacity rules as live mode).
+        # -------------------------------------------------------------------
+        test_mode_enabled = bool((bot_cfg or {}).get("test_mode", False))
+        if test_mode_enabled and bc_str and rpc:
+            # Atomic gate: claim position slot before price fetch
+            async with _position_entry_lock:
+                _tgate_cfg = _read_bot_config() or {}
+                _tgate_open = int(_tgate_cfg.get("open_positions", 0))
+                _tgate_max = int(_tgate_cfg.get("max_concurrent_positions", 1))
+                if _tgate_open >= _tgate_max:
+                    logger.info(
+                        f"[#{count}] [GATE] Race: test position limit {_tgate_open}/{_tgate_max} already consumed, skip"
+                    )
+                    return
+                if _stop_scanning:
+                    return
+                await _update_bot_config({"open_positions": _tgate_open + 1})
+                logger.info(f"[POSITION] open_positions → {_tgate_open + 1} for {mint_str} (TEST) [GATE]")
+
+            logger.info(
+                f"[#{count}] [TEST MC DEBUG] virtual_sol_reserves from event: {token_info.virtual_sol_reserves}"
+            )
+            cur_price_test = await _get_current_token_price_sol(bc_str, rpc)
+            logger.info(f"[#{count}] [TEST MC DEBUG] cur_price_test (RPC fetch result): {cur_price_test}")
+            if cur_price_test is None or cur_price_test <= 0:
+                _cfg_revert = _read_bot_config() or {}
+                await _update_bot_config({"open_positions": max(0, int(_cfg_revert.get("open_positions", 1)) - 1)})
+                logger.warning(
+                    f"[#{count}] Test mode: could not fetch entry price for {mint_str[:8]}"
+                )
+                return
+            if True:
+                # TEST MODE ONLY — slippage simulation. Live path is unchanged below.
+                simulated_entry_price = cur_price_test * 1.15
+                sol_usd_test = _sol_price_usd
+                simulated_entry_mc = (
+                    simulated_entry_price * _PUMP_FUN_TOTAL_SUPPLY * sol_usd_test
+                    if sol_usd_test > 0 else 0.0
+                )
+                logger.info(f"[#{count}] [TEST MC DEBUG] simulated_entry_mc: ${simulated_entry_mc:.0f}")
+
+                # MC range check — same filter as live mode, applied at simulated entry price
+                _mc_min_t = float(filt.get("min_entry_mc_usd", 0))
+                _mc_max_t = float(filt.get("max_entry_mc_usd", 0))
+                if _mc_min_t > 0 and simulated_entry_mc < _mc_min_t:
+                    _cfg_revert = _read_bot_config() or {}
+                    await _update_bot_config({"open_positions": max(0, int(_cfg_revert.get("open_positions", 1)) - 1)})
+                    logger.info(
+                        f"[#{count}] [TEST] MC entry ${simulated_entry_mc:.0f} < min ${_mc_min_t:.0f} → skip"
+                    )
+                    asyncio.create_task(tg.send_message(
+                        f"🧪 <b>TEST: симуляция отменена</b>\n"
+                        f"⛔ MC входа {_format_mc(simulated_entry_mc)} ниже минимума {_format_mc(_mc_min_t)}"
+                    ))
+                    return
+                if _mc_max_t > 0 and simulated_entry_mc > _mc_max_t:
+                    _cfg_revert = _read_bot_config() or {}
+                    await _update_bot_config({"open_positions": max(0, int(_cfg_revert.get("open_positions", 1)) - 1)})
+                    logger.info(
+                        f"[#{count}] [TEST] MC entry ${simulated_entry_mc:.0f} > max ${_mc_max_t:.0f} → skip"
+                    )
+                    asyncio.create_task(tg.send_message(
+                        f"🧪 <b>TEST: симуляция отменена</b>\n"
+                        f"⛔ MC входа {_format_mc(simulated_entry_mc)} выше максимума {_format_mc(_mc_max_t)}"
+                    ))
+                    return
+
+                test_buy_amount = float(preset.get("buy_amount_sol", 0.01))
+                sim_tokens = test_buy_amount / simulated_entry_price
+                test_priority = float(preset.get("priority_fee_sol", 0.001))
+                test_jito = float(preset.get("jito_tip_sol", 0.003))
+                test_gas = float(preset.get("gas_fee_sol", 0.00005))
+                test_fees = test_priority + test_jito + test_gas
+                test_total = test_buy_amount + test_fees
+
+                test_exit_tp: list[str] = []
+                for _i, _tp in enumerate(preset.get("take_profits", []), 1):
+                    test_exit_tp.append(f"  TP{_i}: +{_tp['price_pct']:.0f}% → {_tp['position_pct']:.0f}% позиции")
+                test_exit_sl: list[str] = []
+                for _i, _sl in enumerate(preset.get("stop_losses", []), 1):
+                    test_exit_sl.append(f"  SL{_i}: -{_sl['price_pct']:.0f}% → {_sl['position_pct']:.0f}% позиции")
+                _ts_test = list(preset.get("trailing_stops") or [])
+                if not _ts_test and preset.get("trailing_stop", {}).get("enabled"):
+                    _ts_test = [preset["trailing_stop"]]
+                test_exit_trail: list[str] = []
+                for _i, _ts in enumerate(_ts_test, 1):
+                    if _ts.get("enabled", True):
+                        test_exit_trail.append(
+                            f"  Trail{_i}: act +{_ts['activation_pct']:.0f}% | trail -{_ts['trail_size_pct']:.0f}% | {_ts['position_pct']:.0f}%"
+                        )
+
+                test_buy_lines = [
+                    "🧪 <b>TEST MODE — СИМУЛИРОВАННАЯ ПОКУПКА</b>",
+                    f"🔥 {_escape_html(token_info.name)} (${_escape_html(token_info.symbol)})",
+                    f"📍 MC входа (с учётом слиппеджа 15%): {_format_mc(simulated_entry_mc)}",
+                ]
+                test_buy_lines += [
+                    f"💰 Вложено (симуляция): {test_buy_amount:.6f} SOL → {sim_tokens:.4f} токенов",
+                    f"💸 Комиссии (не выплачены): priority {test_priority:.5f} + jito {test_jito:.5f} + gas {test_gas:.5f} = {test_fees:.5f} SOL",
+                    f"💼 Итого (симуляция): {test_total:.6f} SOL",
+                    "📈 Стратегия выхода:",
+                ]
+                if test_exit_tp:
+                    test_buy_lines.extend(test_exit_tp)
+                else:
+                    test_buy_lines.append("  Take Profit: не настроено")
+                if test_exit_sl:
+                    test_buy_lines.extend(test_exit_sl)
+                else:
+                    test_buy_lines.append("  Stop Loss: не настроено")
+                if test_exit_trail:
+                    test_buy_lines.extend(test_exit_trail)
+                else:
+                    test_buy_lines.append("  Trailing Stop: не настроено")
+
+                asyncio.create_task(tg.send_message("\n".join(test_buy_lines)))
+
+                sim_pos = SimulatedPosition(
+                    mint=mint_str,
+                    symbol=token_info.symbol,
+                    name=token_info.name,
+                    entry_price_sol=simulated_entry_price,
+                    entry_mc_usd=simulated_entry_mc,
+                    simulated_token_amount=sim_tokens,
+                    entry_sol=test_buy_amount,
+                    priority_fee_sol=test_priority,
+                    jito_tip_sol=test_jito,
+                    gas_fee_sol=test_gas,
+                    total_cost_sol=test_total,
+                    entry_timestamp=time.time(),
+                    preset_snapshot=dict(preset),
+                    platform=token_info.platform,
+                    bonding_curve=bc_str,
+                    is_cashback_coin=bool(getattr(token_info, "is_cashback_coin", False)),
+                    sol_price_at_entry=sol_usd_test,
+                    active_preset_id=active_preset_id,
+                )
+
+                await _update_bot_config({
+                    "stats": {
+                        "test_buys_executed": (
+                            ((bot_cfg or {}).get("stats") or {}).get("test_buys_executed", 0) + 1
+                        )
+                    }
+                })
+
+                # N-trades mode: test buys count toward the same limit as real buys
+                successful_buys_this_session += 1
+                if bot_mode == "n" and successful_buys_this_session >= max_trades_count:
+                    _stop_scanning = True
+                    asyncio.create_task(tg.send_message(
+                        f"✅ <b>Сессия завершена.</b>\n"
+                        f"🎯 Выполнено {successful_buys_this_session}/{max_trades_count} сделок.\n"
+                        f"🔴 Бот приостановлен. Нажми Stop → Start для новой сессии."
+                    ))
+
+                def _on_test_close() -> None:
+                    async def _decrement() -> None:
+                        _c = _read_bot_config() or {}
+                        await _update_bot_config(
+                            {"open_positions": max(0, int(_c.get("open_positions", 1)) - 1)}
+                        )
+                        logger.info("[POSITION] test position closed, open_positions decremented")
+                    asyncio.get_running_loop().create_task(_decrement())
+
+                asyncio.create_task(
+                    monitor_position_test(
+                        sim_pos=sim_pos,
+                        rpc_endpoint=rpc,
+                        notify_fn=tg.send_message,
+                        sol_price_getter=lambda: _sol_price_usd,
+                        position_close_fn=_on_test_close,
+                    )
+                )
+                logger.info(
+                    f"[#{count}] Test mode: simulated buy {test_buy_amount} SOL @ "
+                    f"{cur_price_test:.8f} → {sim_tokens:.4f} tokens"
+                )
 
     logger.info(
         "Слушаю новые токены...\n"
@@ -1364,7 +1779,15 @@ async def run_scanner(config_path: str) -> None:
         error_msg = f"Сканер остановлен из-за ошибки: {e}"
         logger.exception(error_msg)
         try:
-            await telegram.send_error_message(str(e))
+            crash_cfg = _read_bot_config() or {}
+            open_pos = crash_cfg.get("open_positions", 0)
+            crash_msg = (
+                f"🚨 <b>КРАШ СКАНЕРА</b>\n"
+                f"<code>{_escape_html(str(e))}</code>\n"
+                f"📊 Открытых позиций: {open_pos}\n"
+                f"🔄 Покупок в сессии: {successful_buys_this_session}"
+            )
+            await telegram.send_message(crash_msg)
         except Exception:
             pass
 

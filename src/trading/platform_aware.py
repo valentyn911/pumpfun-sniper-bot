@@ -202,9 +202,15 @@ class PlatformAwareBuyer(Trader):
                 sol_destination = self._get_sol_destination(
                     token_info, address_provider
                 )
-                tokens_raw, sol_spent = await self.client.get_buy_transaction_details(
-                    str(tx_signature), token_info.mint, sol_destination
-                )
+                tokens_raw, sol_spent = None, None
+                for _parse_attempt in range(5):
+                    tokens_raw, sol_spent = await self.client.get_buy_transaction_details(
+                        str(tx_signature), token_info.mint, sol_destination
+                    )
+                    if tokens_raw is not None and sol_spent is not None:
+                        break
+                    if _parse_attempt < 4:
+                        await asyncio.sleep(1.0)
 
                 if tokens_raw is not None and sol_spent is not None:
                     actual_amount = tokens_raw / 10**TOKEN_DECIMALS
@@ -220,10 +226,9 @@ class PlatformAwareBuyer(Trader):
                     token_amount = actual_amount
                     token_price_sol = actual_price
                 else:
-                    raise ValueError(
-                        f"Failed to parse transaction details: tokens={tokens_raw}, "
-                        f"sol_spent={sol_spent} (tx: {tx_signature}). "
-                        f"The transaction may have failed on-chain — check explorer."
+                    logger.warning(
+                        f"get_buy_transaction_details failed after 5 attempts for {tx_signature}. "
+                        f"Using estimated values: tokens={token_amount:.6f}, price={token_price_sol:.10f}"
                     )
 
                 return TradeResult(

@@ -32,13 +32,20 @@ DEFAULT_CONFIG = {
     "max_concurrent_positions": 1,
     "open_positions": 0,
     "auto_trading": False,
+    "test_mode": False,
     "mode": "infinite",
     "max_trades": 10,
     "stats": {
         "tokens_found_today": 0,
         "tokens_passed_filters": 0,
         "buys_executed": 0,
-        "open_positions": 0,
+        "test_buys_executed": 0,
+        "test_wins": 0,
+        "test_losses": 0,
+        "test_total_pnl_sol": 0.0,
+        "real_wins": 0,
+        "real_losses": 0,
+        "real_total_pnl_sol": 0.0,
     },
     "presets": {
         "1": {
@@ -52,8 +59,8 @@ DEFAULT_CONFIG = {
             "max_retries": 1,
             "take_profits": [{"price_pct": 50, "position_pct": 50}],
             "stop_losses": [{"price_pct": 30, "position_pct": 100}],
-            "trailing_stop": {"enabled": False, "activation_pct": 30, "trail_size_pct": 20, "position_pct": 50},
-            "filters": {"min_dev_buy_sol": 0.1, "min_ath_last5": 0, "min_migrations_last5": 0, "min_entry_mc_usd": 0, "max_entry_mc_usd": 0},
+            "trailing_stops": [],
+            "filters": {"min_dev_buy_sol": 0.1, "dev_buy_check_enabled": False, "min_ath_last5": 0, "ath_require_all": False, "min_migrations_last5": 0, "min_tx_count": 0, "max_tx_count": 0, "tx_count_require_all": False, "min_lifetime_minutes": 0, "lifetime_require_all": False, "min_entry_mc_usd": 0, "max_entry_mc_usd": 0},
         },
         "2": {
             "name": "Preset 2",
@@ -66,8 +73,8 @@ DEFAULT_CONFIG = {
             "max_retries": 1,
             "take_profits": [],
             "stop_losses": [],
-            "trailing_stop": {"enabled": False, "activation_pct": 50, "trail_size_pct": 20, "position_pct": 100},
-            "filters": {"min_dev_buy_sol": 0.5, "min_ath_last5": 0, "min_migrations_last5": 0, "min_entry_mc_usd": 0, "max_entry_mc_usd": 0},
+            "trailing_stops": [],
+            "filters": {"min_dev_buy_sol": 0.5, "dev_buy_check_enabled": True, "min_ath_last5": 0, "ath_require_all": False, "min_migrations_last5": 0, "min_tx_count": 0, "max_tx_count": 0, "tx_count_require_all": False, "min_lifetime_minutes": 0, "lifetime_require_all": False, "min_entry_mc_usd": 0, "max_entry_mc_usd": 0},
         },
         "3": {
             "name": "Preset 3",
@@ -80,8 +87,8 @@ DEFAULT_CONFIG = {
             "max_retries": 1,
             "take_profits": [],
             "stop_losses": [],
-            "trailing_stop": {"enabled": False, "activation_pct": 100, "trail_size_pct": 30, "position_pct": 100},
-            "filters": {"min_dev_buy_sol": 1.0, "min_ath_last5": 20000, "min_migrations_last5": 1, "min_entry_mc_usd": 0, "max_entry_mc_usd": 0},
+            "trailing_stops": [],
+            "filters": {"min_dev_buy_sol": 1.0, "dev_buy_check_enabled": True, "min_ath_last5": 20000, "ath_require_all": False, "min_migrations_last5": 1, "min_tx_count": 0, "max_tx_count": 0, "tx_count_require_all": False, "min_lifetime_minutes": 0, "lifetime_require_all": False, "min_entry_mc_usd": 0, "max_entry_mc_usd": 0},
         },
     },
 }
@@ -214,7 +221,13 @@ def start_bot() -> tuple[bool, str]:
         "tokens_found_today": 0,
         "tokens_passed_filters": 0,
         "buys_executed": 0,
-        "open_positions": 0,
+        "test_buys_executed": 0,
+        "test_wins": 0,
+        "test_losses": 0,
+        "test_total_pnl_sol": 0.0,
+        "real_wins": 0,
+        "real_losses": 0,
+        "real_total_pnl_sol": 0.0,
     }
     cfg["open_positions"] = 0
     save_config(cfg)
@@ -321,7 +334,30 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/stop":
             ok, msg = stop_bot()
+            # Always reset counters/stats — even if bot was already stopped,
+            # this clears any stuck open_positions from a crashed session.
+            cfg = load_config()
+            cfg["stats"] = {
+                "tokens_found_today": 0,
+                "tokens_passed_filters": 0,
+                "buys_executed": 0,
+                "test_buys_executed": 0,
+                "test_wins": 0,
+                "test_losses": 0,
+                "test_total_pnl_sol": 0.0,
+                "real_wins": 0,
+                "real_losses": 0,
+                "real_total_pnl_sol": 0.0,
+            }
+            cfg["open_positions"] = 0
+            save_config(cfg)
             self._send_json({"success": ok, "message": msg})
+
+        elif path == "/api/reset-positions":
+            cfg = load_config()
+            cfg["open_positions"] = 0
+            save_config(cfg)
+            self._send_json({"success": True, "message": "Positions reset to 0"})
 
         elif path == "/api/config":
             try:
