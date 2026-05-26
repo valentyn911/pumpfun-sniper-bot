@@ -121,9 +121,38 @@ label:first-child{margin-top:0}
 .tp-summary b{color:var(--green)}
 .tp-summary .moonbag{color:var(--purple)}
 
-/* Trailing stop */
+/* Trailing stop (legacy, kept for pair hint rendering) */
 .trail-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
 .trail-grid label{margin-top:0}
+
+/* TP/Trail paired rows */
+.pair-row{display:flex;flex-direction:column;gap:5px;margin-bottom:8px;padding:8px 10px;background:#0a0f1a;border-radius:6px;border:1px solid var(--border2)}
+.pair-row-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1px}
+.pair-row-hint{font-size:9px;color:var(--muted);opacity:.7;font-style:italic}
+/* pair-side: nowrap so each row stays on one line and items get their full width */
+.pair-side{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;min-width:0}
+/* CHANGE 2: disabled dims inputs/labels but keeps the toggle label fully clickable */
+.pair-side.disabled input[type=number]{opacity:.35;pointer-events:none}
+.pair-side.disabled .pair-tag,.pair-side.disabled .pair-sign,.pair-side.disabled .pair-field-label{opacity:.35}
+.pair-side.disabled label.toggle{pointer-events:auto !important;opacity:1 !important}
+.pair-tag{font-size:9px;font-weight:700;letter-spacing:.05em;padding:1px 5px;border-radius:2px;flex-shrink:0}
+.pair-tag.tp{background:#1a2a1a;color:var(--green)}
+.pair-tag.trail{background:#2a2010;color:var(--yellow)}
+.pair-delete{width:20px;height:20px;border-radius:4px;border:none;background:#2a1515;color:var(--red);cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.pair-delete:hover{background:#3a2020}
+.pair-field-label{font-size:10px;color:var(--muted);white-space:nowrap;flex-shrink:0}
+.pair-sign{font-size:11px;flex-shrink:0}
+/* readonly Trail pos% field — dashed border signals it is auto-managed */
+.pair-tr-pos-auto{opacity:.5;cursor:not-allowed;border-style:dashed !important;background:#0a0f1a}
+
+/* Latency hints on filter toggles */
+.lat-hint{font-size:10px;white-space:nowrap;transition:color .15s;margin-right:4px;flex-shrink:0}
+/* Filter toggle rows */
+.filter-toggle-row{display:flex;align-items:center;justify-content:space-between;margin-top:8px;margin-bottom:2px;padding:4px 6px;background:#0a0f1a;border-radius:4px;border:1px solid var(--border2)}
+.filter-toggle-row.disabled-filter input:not([type=checkbox]),.filter-toggle-row.disabled-filter .field-hint{opacity:0.35}
+.filter-section{padding:6px 0 0 0}
+.filter-section.filt-off label:not(.toggle){opacity:0.35}
+.filter-section.filt-off input[type=number]{opacity:0.35;pointer-events:none}
 
 /* Stats */
 .stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:8px}
@@ -138,6 +167,28 @@ label:first-child{margin-top:0}
 .trade-stats-row{display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:12px;color:var(--text)}
 .trade-stats-row span{white-space:nowrap}
 .pnl-pos{color:var(--green)}.pnl-neg{color:var(--red)}.pnl-neutral{color:var(--muted)}
+
+/* Fee mode buttons */
+.fee-mode-row{display:flex;align-items:center;gap:6px;margin-top:8px;flex-wrap:wrap}
+.fee-mode-btn{padding:4px 11px;border-radius:4px;font-size:11px;font-weight:600;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s;white-space:nowrap}
+.fee-mode-btn:hover{background:var(--hover);color:var(--text)}
+.fee-mode-btn.active-auto{background:var(--accent);color:#000;border-color:var(--accent)}
+.fee-mode-btn.active-superfast{background:#f97316;color:#000;border-color:#f97316}
+.fee-mode-btn.active-ultra{background:var(--red);color:#fff;border-color:var(--red)}
+
+/* Cost box */
+.cost-box{margin-top:8px;padding:8px 10px;border-radius:6px;border:1px solid var(--border2);background:#0a0f1a;font-size:11px}
+.cost-box.cost-green{border-color:#2d5a2d;background:#0a1a0a}
+.cost-box.cost-yellow{border-color:#5a4a00;background:#1a1200}
+.cost-box.cost-red{border-color:#5a2d2d;background:#1a0a0a}
+.cost-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:3px}
+.cost-row:last-child{margin-bottom:0;padding-top:4px;border-top:1px solid var(--border2);font-weight:600}
+.cost-label{color:var(--muted)}
+.cost-val{font-family:monospace;color:var(--text)}
+.cost-usd{color:var(--muted);font-size:10px;margin-left:4px}
+.sol-price-line{font-size:10px;color:var(--muted);margin-top:5px;text-align:right}
+.fetch-rates-btn{margin-top:6px;width:100%;font-size:10px;padding:4px 0;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s}
+.fetch-rates-btn:hover{background:var(--hover);color:var(--text)}
 
 /* Save bar */
 .save-bar{display:flex;justify-content:flex-end;margin-top:14px;padding-top:12px;border-top:1px solid var(--border2)}
@@ -349,6 +400,9 @@ let cfg = null;
 let currentPreset = 1;
 let balanceTimer = null;
 let statusTimer = null;
+let currentSolPrice = 0;
+let solPriceAge = 0;
+let solPriceTimer = null;
 
 // ============================================================
 // Init
@@ -363,10 +417,27 @@ async function init() {
     balanceTimer = setInterval(pollBalance, 30000);
     document.getElementById('serverDot').className = 'dot on';
     document.getElementById('serverLabel').textContent = 'Connected';
+    // Fetch SOL price on load, then age it every second
+    fetchSolPrice();
+    solPriceTimer = setInterval(() => {
+      solPriceAge = Math.min(solPriceAge + 1, 9999);
+      [1,2,3].forEach(n => updateCostBox(n));
+    }, 1000);
   } catch(e) {
     document.getElementById('serverDot').className = 'dot';
     document.getElementById('serverLabel').textContent = 'Server offline — run: python bot_server.py';
   }
+}
+
+async function fetchSolPrice() {
+  try {
+    const data = await api('GET', '/api/sol-price');
+    if (data.sol_price_usd) {
+      currentSolPrice = data.sol_price_usd;
+      solPriceAge = Math.round(data.age_seconds || 0);
+      [1,2,3].forEach(n => updateCostBox(n));
+    }
+  } catch(e) {}
 }
 
 // ============================================================
@@ -416,22 +487,43 @@ function buildPresetUI(n) {
   buildEntryCol(n, p);
   buildFiltersCol(n, p);
   buildTpSl(n, p);
-  updateAllTrailHints(n);
+  updateTpSummary(n);
 }
 
 function buildEntryCol(n, p) {
+  const feeMode = p.fee_mode || 'auto';
   const el = document.getElementById(`entry-col-${n}`);
   el.innerHTML = `
 <h3>Entry</h3>
 <label>Buy Amount (SOL)</label>
-<input type="number" id="p${n}_buy_amount" value="${p.buy_amount_sol ?? 0.01}" min="0" step="0.001">
-<label>Priority Fee (SOL)</label>
-<input type="number" id="p${n}_priority_fee" value="${p.priority_fee_sol ?? 0.001}" min="0" step="0.0001">
-<label>Jito Tip (SOL)</label>
-<input type="number" id="p${n}_jito_tip" value="${p.jito_tip_sol ?? 0.003}" min="0" step="0.0001">
-<div class="field-hint">0.003 = standard | 0.005 = competitive | 0.01 = high congestion</div>
+<input type="number" id="p${n}_buy_amount" value="${p.buy_amount_sol ?? 0.01}" min="0" step="0.001" oninput="updateCostBox(${n})">
+
+<label>Fee Mode</label>
+<div class="fee-mode-row" id="fee-mode-row-${n}">
+  <button class="fee-mode-btn ${feeMode==='auto'?'active-auto':''}" onclick="setFeeMode(${n},'auto')">AUTO</button>
+  <button class="fee-mode-btn ${feeMode==='superfast'?'active-superfast':''}" onclick="setFeeMode(${n},'superfast')">🚀 SUPER FAST</button>
+  <button class="fee-mode-btn ${feeMode==='ultra'?'active-ultra':''}" onclick="setFeeMode(${n},'ultra')">⚡ ULTRA</button>
+</div>
+
+<div id="auto-fee-fields-${n}" style="display:${feeMode==='auto'?'block':'none'}">
+  <label>Max Priority Fee (SOL)</label>
+  <input type="number" id="p${n}_priority_fee" value="${p.max_priority_fee_sol ?? p.priority_fee_sol ?? 0.001}" min="0" step="0.0001" oninput="updateCostBox(${n})">
+  <div class="field-hint">Helius veryHigh capped at this value.</div>
+  <label>Jito Tip (SOL)</label>
+  <input type="number" id="p${n}_jito_tip" value="${p.jito_tip_sol ?? 0.003}" min="0" step="0.0001" oninput="updateCostBox(${n})">
+  <div class="field-hint">0.003 = standard | 0.005 = competitive | 0.01 = high</div>
+</div>
+<div id="fixed-fee-fields-${n}" style="display:${feeMode!=='auto'?'block':'none'}">
+  <div class="field-hint" style="margin-top:6px;color:var(--muted)">
+    Fixed fees are set by mode — no API delay on buy.
+  </div>
+</div>
+
+<div id="cost-box-${n}" class="cost-box"></div>
+<button class="fetch-rates-btn" onclick="fetchLiveRates(${n})">↻ Fetch Live Rates</button>
+
 <label>Gas Fee (SOL)</label>
-<input type="number" id="p${n}_gas_fee" value="${p.gas_fee_sol ?? 0.000005}" min="0" step="0.000001">
+<input type="number" id="p${n}_gas_fee" value="${p.gas_fee_sol ?? 0.000005}" min="0" step="0.000001" oninput="updateCostBox(${n})">
 <label>Buy Slippage (%)</label>
 <input type="number" id="p${n}_buy_slippage" value="${p.buy_slippage ?? 30}" min="0" max="100">
 <label>Sell Slippage (%)</label>
@@ -439,10 +531,109 @@ function buildEntryCol(n, p) {
 <label>Max Retries</label>
 <input type="number" id="p${n}_max_retries" value="${p.max_retries ?? 1}" min="1">
 `;
+  updateCostBox(n);
+}
+
+// Fee mode constants (must match scanner_runner.py)
+// Priority: µL/CU × 85000 CU / 1e6 (→ lamports) / 1e9 (→ SOL)
+const SUPERFAST_PRIORITY_SOL = 10_000_000 * 85_000 / 1_000_000 / 1_000_000_000;
+const SUPERFAST_JITO_SOL = 10_000_000 / 1_000_000_000;
+const ULTRA_PRIORITY_SOL = 50_000_000 * 85_000 / 1_000_000 / 1_000_000_000;
+const ULTRA_JITO_SOL = 25_000_000 / 1_000_000_000;
+
+function setFeeMode(n, mode) {
+  const row = document.getElementById(`fee-mode-row-${n}`);
+  if (!row) return;
+  row.querySelectorAll('.fee-mode-btn').forEach(btn => {
+    btn.className = 'fee-mode-btn';
+  });
+  const btns = row.querySelectorAll('.fee-mode-btn');
+  if (mode === 'auto') btns[0].classList.add('active-auto');
+  else if (mode === 'superfast') btns[1].classList.add('active-superfast');
+  else btns[2].classList.add('active-ultra');
+
+  document.getElementById(`auto-fee-fields-${n}`).style.display = mode === 'auto' ? 'block' : 'none';
+  document.getElementById(`fixed-fee-fields-${n}`).style.display = mode !== 'auto' ? 'block' : 'none';
+  updateCostBox(n);
+}
+
+function updateCostBox(n) {
+  const box = document.getElementById(`cost-box-${n}`);
+  if (!box) return;
+
+  const feeModeEl = document.querySelector(`#fee-mode-row-${n} .fee-mode-btn.active-auto, #fee-mode-row-${n} .fee-mode-btn.active-superfast, #fee-mode-row-${n} .fee-mode-btn.active-ultra`);
+  const mode = feeModeEl ? (feeModeEl.classList.contains('active-auto') ? 'auto' : feeModeEl.classList.contains('active-superfast') ? 'superfast' : 'ultra') : 'auto';
+
+  let prioritySol, jitoSol;
+  if (mode === 'superfast') {
+    prioritySol = SUPERFAST_PRIORITY_SOL;
+    jitoSol = SUPERFAST_JITO_SOL;
+  } else if (mode === 'ultra') {
+    prioritySol = ULTRA_PRIORITY_SOL;
+    jitoSol = ULTRA_JITO_SOL;
+  } else {
+    prioritySol = parseFloat(document.getElementById(`p${n}_priority_fee`)?.value) || 0;
+    jitoSol = parseFloat(document.getElementById(`p${n}_jito_tip`)?.value) || 0;
+  }
+
+  const gasSol = parseFloat(document.getElementById(`p${n}_gas_fee`)?.value) || 0;
+  const buySol = parseFloat(document.getElementById(`p${n}_buy_amount`)?.value) || 0;
+  const totalFee = prioritySol + jitoSol + gasSol;
+  const total = buySol + totalFee;
+
+  const sp = currentSolPrice;
+  const fmtUsd = (sol) => sp > 0 ? `<span class="cost-usd">($${(sol * sp).toFixed(2)})</span>` : '';
+
+  const ageStr = sp > 0 ? `SOL: $${sp.toFixed(2)} (updated ${Math.round(solPriceAge)}s ago)` : '($ unavailable)';
+
+  let colorClass = 'cost-green';
+  if (totalFee > 0.020) colorClass = 'cost-red';
+  else if (totalFee > 0.006) colorClass = 'cost-yellow';
+
+  box.className = `cost-box ${colorClass}`;
+  box.innerHTML = `
+<div class="cost-row"><span class="cost-label">Priority</span><span class="cost-val">${prioritySol.toFixed(6)} SOL ${fmtUsd(prioritySol)}</span></div>
+<div class="cost-row"><span class="cost-label">Jito Tip</span><span class="cost-val">${jitoSol.toFixed(6)} SOL ${fmtUsd(jitoSol)}</span></div>
+<div class="cost-row"><span class="cost-label">Gas</span><span class="cost-val">${gasSol.toFixed(6)} SOL ${fmtUsd(gasSol)}</span></div>
+<div class="cost-row"><span class="cost-label">Total Entry</span><span class="cost-val">${total.toFixed(6)} SOL ${fmtUsd(total)}</span></div>
+<div class="sol-price-line">${ageStr}</div>
+`;
+}
+
+async function fetchLiveRates(n) {
+  try {
+    const data = await api('GET', '/api/recommended-fees');
+    if (data.sol_price_usd) {
+      currentSolPrice = data.sol_price_usd;
+      solPriceAge = 0;
+    }
+
+    const feeModeEl = document.querySelector(`#fee-mode-row-${n} .fee-mode-btn.active-auto, #fee-mode-row-${n} .fee-mode-btn.active-superfast, #fee-mode-row-${n} .fee-mode-btn.active-ultra`);
+    const mode = feeModeEl ? (feeModeEl.classList.contains('active-auto') ? 'auto' : feeModeEl.classList.contains('active-superfast') ? 'superfast' : 'ultra') : 'auto';
+
+    if (mode === 'auto' && data.priority_fee_sol != null && data.jito_tip_sol != null) {
+      const pfEl = document.getElementById(`p${n}_priority_fee`);
+      const jtEl = document.getElementById(`p${n}_jito_tip`);
+      if (pfEl) pfEl.value = data.priority_fee_sol.toFixed(6);
+      if (jtEl) jtEl.value = data.jito_tip_sol.toFixed(6);
+    }
+
+    updateCostBox(n);
+    const congestion = data.congestion || 'unknown';
+    toast(`Live rates fetched — congestion: ${congestion} (${data.fetch_time_ms}ms)`, false);
+  } catch(e) {
+    toast('Failed to fetch live rates', true);
+  }
 }
 
 function buildFiltersCol(n, p) {
   const f = p.filters || {};
+  const athOn = f.ath_enabled !== false;
+  const migOn = f.migrations_enabled !== false;
+  const nwOn  = f.new_wallet_enabled !== false;
+  const txOn  = f.tx_count_enabled !== false;
+  const ltOn  = f.lifetime_enabled !== false;
+  const mcOn  = f.entry_mc_enabled !== false;
   const el = document.getElementById(`filters-col-${n}`);
   el.innerHTML = `
 <h3>Entry Filters</h3>
@@ -458,59 +649,190 @@ function buildFiltersCol(n, p) {
 </div>
 <input type="number" id="p${n}_min_dev_buy" value="${f.min_dev_buy_sol ?? 0.1}" min="0" step="0.01"${f.dev_buy_check_enabled === false ? ' disabled style="opacity:0.4"' : ''}>
 <div id="p${n}_dev_buy_hint" class="field-hint" style="display:${f.dev_buy_check_enabled === false ? 'block' : 'none'};color:#f59e0b">⚡ Faster entry — dev buy not required</div>
-<label>Min ATH of last 5 tokens ($)</label>
-<input type="number" id="p${n}_min_ath" value="${f.min_ath_last5 ?? 0}" min="0">
-<div class="toggle-row" style="margin-top:6px;margin-bottom:2px">
-  <span class="toggle-label" id="p${n}_ath_mode_lbl">${f.ath_require_all ? 'Every token' : 'Any 1 of 5'}</span>
-  <label class="toggle">
-    <input type="checkbox" id="p${n}_ath_require_all" ${f.ath_require_all ? 'checked' : ''} onchange="onAthModeToggle(${n})">
-    <span class="slider"></span>
-  </label>
-</div>
-<label>Min Migrations in last 5 (0–5)</label>
-<input type="number" id="p${n}_min_mig" value="${f.min_migrations_last5 ?? 0}" min="0" max="5">
 
-<label>TX Count — last 5 tokens</label>
-<div style="display:flex;align-items:center;gap:6px">
-  <input type="number" id="p${n}_min_tx" value="${f.min_tx_count ?? 0}" min="0" placeholder="Min" style="width:72px">
-  <span style="font-size:11px;color:var(--muted)">–</span>
-  <input type="number" id="p${n}_max_tx" value="${f.max_tx_count ?? 0}" min="0" placeholder="Max" style="width:72px">
+<div class="filter-toggle-row">
+  <label style="margin:0;font-size:11px">Min ATH of last 5 ($)</label>
+  <div style="display:flex;align-items:center;gap:4px">
+    <span id="p${n}_lat_ath" class="lat-hint"></span>
+    <label class="toggle" title="Enable ATH filter">
+      <input type="checkbox" id="p${n}_ath_enabled" ${athOn ? 'checked' : ''} onchange="onFilterToggle(${n},'ath');updateLatencyHints(${n})">
+      <span class="slider"></span>
+    </label>
+  </div>
 </div>
-<div class="field-hint">0 = disabled. Rug ≈ 5–50 txs. Real token ≈ 100+.</div>
-<div class="toggle-row" style="margin-top:4px;margin-bottom:2px">
-  <span class="toggle-label" id="p${n}_tx_mode_lbl">${f.tx_count_require_all ? 'Every token' : 'Any 1 of 5'}</span>
-  <label class="toggle">
-    <input type="checkbox" id="p${n}_tx_require_all" ${f.tx_count_require_all ? 'checked' : ''} onchange="onTxModeToggle(${n})">
-    <span class="slider"></span>
-  </label>
+<div id="p${n}_ath_section" class="filter-section${athOn ? '' : ' filt-off'}">
+  <input type="number" id="p${n}_min_ath" value="${f.min_ath_last5 ?? 0}" min="0"${athOn ? '' : ' style="pointer-events:none;opacity:.35"'}>
+  <div class="toggle-row" style="margin-top:6px;margin-bottom:2px">
+    <span class="toggle-label" id="p${n}_ath_mode_lbl">${f.ath_require_all ? 'Every token' : 'Any 1 of 5'}</span>
+    <label class="toggle">
+      <input type="checkbox" id="p${n}_ath_require_all" ${f.ath_require_all ? 'checked' : ''} onchange="onAthModeToggle(${n})">
+      <span class="slider"></span>
+    </label>
+  </div>
 </div>
 
-<label>Min Token Lifetime (minutes)</label>
-<input type="number" id="p${n}_min_lifetime" value="${f.min_lifetime_minutes ?? 0}" min="0" step="0.5">
-<div class="field-hint">0 = disabled. Minutes a token traded before dying.</div>
-<div class="toggle-row" style="margin-top:4px;margin-bottom:2px">
-  <span class="toggle-label" id="p${n}_lt_mode_lbl">${f.lifetime_require_all ? 'Every token' : 'Any 1 of 5'}</span>
-  <label class="toggle">
-    <input type="checkbox" id="p${n}_lt_require_all" ${f.lifetime_require_all ? 'checked' : ''} onchange="onLifetimeModeToggle(${n})">
-    <span class="slider"></span>
-  </label>
+<div class="filter-toggle-row">
+  <label style="margin:0;font-size:11px">Min Migrations in last 5 (0–5)</label>
+  <div style="display:flex;align-items:center;gap:4px">
+    <span id="p${n}_lat_mig" class="lat-hint"></span>
+    <label class="toggle" title="Enable migrations filter">
+      <input type="checkbox" id="p${n}_mig_enabled" ${migOn ? 'checked' : ''} onchange="onFilterToggle(${n},'mig');updateLatencyHints(${n})">
+      <span class="slider"></span>
+    </label>
+  </div>
+</div>
+<div id="p${n}_mig_section" class="filter-section${migOn ? '' : ' filt-off'}">
+  <input type="number" id="p${n}_min_mig" value="${f.min_migrations_last5 ?? 0}" min="0" max="5"${migOn ? '' : ' style="pointer-events:none;opacity:.35"'}>
 </div>
 
-<label>Entry MC Range ($)</label>
-<div style="display:flex;align-items:center;gap:6px">
-  <input type="number" id="p${n}_min_entry_mc" value="${f.min_entry_mc_usd ?? 0}" min="0" placeholder="Min" style="width:84px">
-  <span style="font-size:11px;color:var(--muted)">–</span>
-  <input type="number" id="p${n}_max_entry_mc" value="${f.max_entry_mc_usd ?? 0}" min="0" placeholder="Max" style="width:84px">
+<div class="filter-toggle-row">
+  <label style="margin:0;font-size:11px">New Wallet Dev</label>
+  <div style="display:flex;align-items:center;gap:4px">
+    <span id="p${n}_lat_nw" class="lat-hint"></span>
+    <label class="toggle" title="Allow new wallets (no prior launches)">
+      <input type="checkbox" id="p${n}_new_wallet_enabled" ${nwOn ? 'checked' : ''} onchange="updateLatencyHints(${n})">
+      <span class="slider"></span>
+    </label>
+  </div>
 </div>
-<div class="field-hint">0 = disabled. Bot only buys if MC is within this range at entry moment.</div>
+<div class="field-hint" id="p${n}_nw_hint">${nwOn ? 'Dev has no prior token launches on pump.fun' : '⚡ New wallets silently ignored — no alerts'}</div>
 
-<h3>Trailing Stops <span style="color:var(--muted);font-weight:400">(up to 3)</span></h3>
-<div id="trail-rows-${n}">${(()=>{
-  const tsList = p.trailing_stops || (p.trailing_stop ? [p.trailing_stop] : []);
-  return tsList.map((ts,i) => makeTrailRow(n,i,ts.activation_pct,ts.trail_size_pct,ts.position_pct,ts.enabled!==false)).join('');
-})()}</div>
-<button class="btn btn-ghost add-btn" onclick="addTrailRow(${n})" style="margin-top:6px">+ Add Trailing Stop</button>
+<div class="filter-toggle-row">
+  <label style="margin:0;font-size:11px">TX Count — last 5 tokens</label>
+  <div style="display:flex;align-items:center;gap:4px">
+    <span id="p${n}_lat_tx" class="lat-hint"></span>
+    <label class="toggle" title="Enable TX count filter">
+      <input type="checkbox" id="p${n}_tx_enabled" ${txOn ? 'checked' : ''} onchange="onFilterToggle(${n},'tx');updateLatencyHints(${n})">
+      <span class="slider"></span>
+    </label>
+  </div>
+</div>
+<div id="p${n}_tx_section" class="filter-section${txOn ? '' : ' filt-off'}">
+  <div style="display:flex;align-items:center;gap:6px">
+    <input type="number" id="p${n}_min_tx" value="${f.min_tx_count ?? 0}" min="0" placeholder="Min" style="width:72px${txOn ? '' : ';pointer-events:none;opacity:.35'}">
+    <span style="font-size:11px;color:var(--muted)">–</span>
+    <input type="number" id="p${n}_max_tx" value="${f.max_tx_count ?? 0}" min="0" placeholder="Max" style="width:72px${txOn ? '' : ';pointer-events:none;opacity:.35'}">
+  </div>
+  <div class="field-hint">0 = disabled. Rug ≈ 5–50 txs. Real token ≈ 100+.</div>
+  <div class="toggle-row" style="margin-top:4px;margin-bottom:2px">
+    <span class="toggle-label" id="p${n}_tx_mode_lbl">${f.tx_count_require_all ? 'Every token' : 'Any 1 of 5'}</span>
+    <label class="toggle">
+      <input type="checkbox" id="p${n}_tx_require_all" ${f.tx_count_require_all ? 'checked' : ''} onchange="onTxModeToggle(${n})">
+      <span class="slider"></span>
+    </label>
+  </div>
+</div>
+
+<div class="filter-toggle-row">
+  <label style="margin:0;font-size:11px">Min Token Lifetime (minutes)</label>
+  <div style="display:flex;align-items:center;gap:4px">
+    <span id="p${n}_lat_lt" class="lat-hint"></span>
+    <label class="toggle" title="Enable lifetime filter">
+      <input type="checkbox" id="p${n}_lt_enabled" ${ltOn ? 'checked' : ''} onchange="onFilterToggle(${n},'lt');updateLatencyHints(${n})">
+      <span class="slider"></span>
+    </label>
+  </div>
+</div>
+<div id="p${n}_lt_section" class="filter-section${ltOn ? '' : ' filt-off'}">
+  <input type="number" id="p${n}_min_lifetime" value="${f.min_lifetime_minutes ?? 0}" min="0" step="0.5"${ltOn ? '' : ' style="pointer-events:none;opacity:.35"'}>
+  <div class="field-hint">0 = disabled. Minutes a token traded before dying.</div>
+  <div class="toggle-row" style="margin-top:4px;margin-bottom:2px">
+    <span class="toggle-label" id="p${n}_lt_mode_lbl">${f.lifetime_require_all ? 'Every token' : 'Any 1 of 5'}</span>
+    <label class="toggle">
+      <input type="checkbox" id="p${n}_lt_require_all" ${f.lifetime_require_all ? 'checked' : ''} onchange="onLifetimeModeToggle(${n})">
+      <span class="slider"></span>
+    </label>
+  </div>
+</div>
+
+<div class="filter-toggle-row">
+  <label style="margin:0;font-size:11px">Entry MC Range ($)</label>
+  <div style="display:flex;align-items:center;gap:4px">
+    <span id="p${n}_lat_mc" class="lat-hint"></span>
+    <label class="toggle" title="Enable entry MC filter">
+      <input type="checkbox" id="p${n}_mc_enabled" ${mcOn ? 'checked' : ''} onchange="onFilterToggle(${n},'mc');updateLatencyHints(${n})">
+      <span class="slider"></span>
+    </label>
+  </div>
+</div>
+<div id="p${n}_mc_section" class="filter-section${mcOn ? '' : ' filt-off'}">
+  <div style="display:flex;align-items:center;gap:6px">
+    <input type="number" id="p${n}_min_entry_mc" value="${f.min_entry_mc_usd ?? 0}" min="0" placeholder="Min" style="width:84px${mcOn ? '' : ';pointer-events:none;opacity:.35'}">
+    <span style="font-size:11px;color:var(--muted)">–</span>
+    <input type="number" id="p${n}_max_entry_mc" value="${f.max_entry_mc_usd ?? 0}" min="0" placeholder="Max" style="width:84px${mcOn ? '' : ';pointer-events:none;opacity:.35'}">
+  </div>
+  <div class="field-hint">0 = disabled. Bot only buys if MC is within this range at entry moment.</div>
+</div>
 `;
+  updateLatencyHints(n);
+}
+
+function onFilterToggle(n, type) {
+  const ids = { ath: `p${n}_ath_enabled`, mig: `p${n}_mig_enabled`, tx: `p${n}_tx_enabled`, lt: `p${n}_lt_enabled`, mc: `p${n}_mc_enabled` };
+  const on = document.getElementById(ids[type]).checked;
+  const sec = document.getElementById(`p${n}_${type}_section`);
+  if (sec) {
+    sec.classList.toggle('filt-off', !on);
+    sec.querySelectorAll('input[type=number]').forEach(el => {
+      el.style.pointerEvents = on ? '' : 'none';
+      el.style.opacity = on ? '' : '0.35';
+    });
+  }
+}
+
+// Latency hint labels — estimated ms added to pipeline per filter.
+// ATH/Migrations share the GMGN CLI call (~1500ms). When ATH is off but
+// Migrations is on, the Helius-native BC check runs instead (~400ms).
+// TX Count and Lifetime share Stream 4 (~600ms).
+// Dev Buy runs in parallel — zero latency in common case.
+// Entry MC is sequential after all other filters (~400ms).
+// Update these values after collecting real measurements (see logs: [TIMING]).
+const LAT = { ath: 1500, mig_helius: 400, tx: 600, mc: 400 };
+function updateLatencyHints(n) {
+  const athOn = !!document.getElementById(`p${n}_ath_enabled`)?.checked;
+  const migOn = !!document.getElementById(`p${n}_mig_enabled`)?.checked;
+  const nwOn  = !!document.getElementById(`p${n}_new_wallet_enabled`)?.checked;
+  const txOn  = !!document.getElementById(`p${n}_tx_enabled`)?.checked;
+  const ltOn  = !!document.getElementById(`p${n}_lt_enabled`)?.checked;
+  const mcOn  = !!document.getElementById(`p${n}_mc_enabled`)?.checked;
+
+  function setH(id, text, isOn) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = text;
+    el.style.color = isOn ? 'var(--yellow)' : 'var(--green)';
+    el.style.opacity = text ? '1' : '0';
+  }
+
+  // ATH: triggers GMGN CLI call
+  setH(`p${n}_lat_ath`, athOn ? `+${LAT.ath}ms` : `-${LAT.ath}ms saved`, athOn);
+
+  // Migrations: shared with ATH if ATH is on; Helius-native when ATH is off
+  if (migOn) {
+    if (athOn) setH(`p${n}_lat_mig`, 'incl. with ATH ↑', true);
+    else       setH(`p${n}_lat_mig`, `+${LAT.mig_helius}ms (Helius)`, true);
+  } else {
+    setH(`p${n}_lat_mig`, athOn ? '' : `-${LAT.mig_helius}ms saved`, false);
+  }
+
+  // TX Count: triggers Stream 4 (getSignaturesForAddress batch)
+  setH(`p${n}_lat_tx`, txOn ? `+${LAT.tx}ms` : `-${LAT.tx}ms saved`, txOn);
+
+  // Lifetime: shares Stream 4 with TX Count
+  if (ltOn) {
+    if (txOn) setH(`p${n}_lat_lt`, 'incl. with TX ↑', true);
+    else      setH(`p${n}_lat_lt`, `+${LAT.tx}ms`, true);
+  } else {
+    setH(`p${n}_lat_lt`, txOn ? '' : `-${LAT.tx}ms saved`, false);
+  }
+
+  // Entry MC: sequential after all filters
+  setH(`p${n}_lat_mc`, mcOn ? `+${LAT.mc}ms` : `-${LAT.mc}ms saved`, mcOn);
+
+  // New Wallet: no extra fetch — detection uses already-fetched histories + dev.total_launches
+  setH(`p${n}_lat_nw`, nwOn ? '+0ms (no extra fetch)' : '', nwOn);
+  const nwHint = document.getElementById(`p${n}_nw_hint`);
+  if (nwHint) nwHint.textContent = nwOn ? 'Dev has no prior token launches on pump.fun' : '⚡ New wallets silently ignored — no alerts';
 }
 
 function onAthModeToggle(n) {
@@ -590,11 +912,8 @@ function updateAllTrailHints(n) {
 }
 
 function addTrailRow(n) {
-  const c = document.getElementById(`trail-rows-${n}`);
-  if (c.querySelectorAll('.trail-row').length >= 3) { toast('Max 3 trailing stops', true); return; }
-  const i = Date.now();
-  c.insertAdjacentHTML('beforeend', makeTrailRow(n, i, 40, 25, 100, true));
-  updateTrailHint(n, i);
+  // Legacy: now pairs are used. Redirect to addPairRow.
+  addPairRow(n);
 }
 
 function removeTrailRow(n, i) {
@@ -606,16 +925,33 @@ function buildTpSl(n, p) {
   const el = document.getElementById(`tp-sl-${n}`);
   const tps = p.take_profits || [];
   const sls = p.stop_losses || [];
+  const trails = p.trailing_stops || (p.trailing_stop ? [p.trailing_stop] : []);
 
-  let tpRows = tps.map((tp, i) => makeTpRow(n, i, tp.price_pct, tp.position_pct)).join('');
+  // Build paired rows — Trail pos% always mirrors TP pos% on load
+  const pairCount = Math.max(tps.length, trails.length);
+  let pairRows = '';
+  for (let i = 0; i < pairCount; i++) {
+    const tp = tps[i] || null;
+    const tr = trails[i] || null;
+    const tpPos = tp ? tp.position_pct : 33; // Trail pos always mirrors this
+    pairRows += makePairRow(n, i,
+      tp !== null,                             tp ? tp.price_pct : 50, tpPos,
+      tr !== null && tr.enabled !== false,     tr ? tr.activation_pct : 0, tr ? tr.trail_size_pct : 25, tpPos
+    );
+  }
+  if (!pairCount) {
+    pairRows = makePairRow(n, 0, true, 20, 33, true, 0, 25, 33);
+  }
+
   let slRows = sls.map((sl, i) => makeSlRow(n, i, sl.price_pct, sl.position_pct)).join('');
 
+  // CHANGE 1: pairs column is wider (2fr) than SL column (1fr)
   el.innerHTML = `
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:0 20px">
+<div style="display:grid;grid-template-columns:2fr 1fr;gap:0 20px">
 <div>
-<h3>Take Profit <span style="color:var(--muted);font-weight:400">(up to 8)</span></h3>
-<div id="tp-rows-${n}">${tpRows}</div>
-<button class="btn btn-ghost add-btn" onclick="addTpRow(${n})">+ Add TP</button>
+<h3>Take Profit / Trailing Stop Pairs <span style="color:var(--muted);font-weight:400">(up to 10)</span></h3>
+<div id="pair-rows-${n}">${pairRows}</div>
+<button class="btn btn-ghost add-btn" onclick="addPairRow(${n})">+ Add Pair</button>
 <div class="tp-summary" id="tp-summary-${n}"></div>
 </div>
 <div>
@@ -626,44 +962,135 @@ function buildTpSl(n, p) {
 </div>`;
 
   updateTpSummary(n);
+  renumberRows(n);
 }
 
-function makeTpRow(n, i, price, pos) {
-  return `<div class="tp-row" id="tp-row-${n}-${i}">
-  <span class="row-label">+</span>
-  <input type="number" id="tp-price-${n}-${i}" value="${price ?? 50}" min="0.1" step="1" placeholder="%" title="Price increase %" oninput="updateTpSummary(${n})">
-  <span class="row-label">% |</span>
-  <input type="number" id="tp-pos-${n}-${i}" value="${pos ?? 50}" min="1" max="100" step="1" placeholder="%" title="Position %" oninput="updateTpSummary(${n})">
-  <span class="row-label">% pos</span>
-  <button class="remove-btn" onclick="removeTpRow(${n},${i})" title="Remove">×</button>
+function renumberRows(n) {
+  const pairRows = document.getElementById(`pair-rows-${n}`)?.querySelectorAll('.pair-row') || [];
+  pairRows.forEach((row, idx) => {
+    const num = idx + 1;
+    const i = row.id.split('-').slice(-1)[0];
+    const tpTag = row.querySelector(`#pair-tp-${n}-${i} .pair-tag.tp`);
+    const trTag = row.querySelector(`#pair-tr-${n}-${i} .pair-tag.trail`);
+    if (tpTag) tpTag.textContent = `TP ${num}`;
+    if (trTag) trTag.textContent = `Trail ${num}`;
+  });
+  const slRows = document.getElementById(`sl-rows-${n}`)?.querySelectorAll('.sl-row') || [];
+  slRows.forEach((row, idx) => {
+    const label = row.querySelector('.row-label');
+    if (label) label.textContent = `SL ${idx + 1}`;
+  });
+}
+
+function makePairRow(n, i, tpEn, tpPrice, tpPos, trEn, trAct, trTrail, trPos) {
+  tpPrice = tpPrice ?? 50; tpPos = tpPos ?? 33;
+  trAct   = trAct   ?? 0;  trTrail = trTrail ?? 25;
+  // CHANGE 3: Trail pos% always mirrors TP pos% — ignore incoming trPos
+  trPos = tpPos;
+  return `<div class="pair-row" id="pair-row-${n}-${i}">
+  <div class="pair-row-header">
+    <span class="pair-row-hint">Paired exits: TP &amp; Trail share the same position% — whichever fires first, the other sells from what remains</span>
+    <button class="pair-delete" onclick="removePairRow(${n},${i})" title="Remove pair">&times;</button>
+  </div>
+  <div class="pair-side${tpEn ? '' : ' disabled'}" id="pair-tp-${n}-${i}">
+    <span class="pair-tag tp">TP</span>
+    <label class="toggle" style="flex-shrink:0;margin:0" title="Enable TP">
+      <input type="checkbox" id="pair-tp-en-${n}-${i}" ${tpEn ? 'checked' : ''} onchange="onPairSideToggle(${n},${i},'tp')">
+      <span class="slider"></span>
+    </label>
+    <span class="pair-sign" style="color:var(--green)">+</span>
+    <input type="number" id="pair-tp-price-${n}-${i}" value="${tpPrice}" min="0.1" step="1" style="width:64px" title="TP trigger price %" oninput="onTpPriceChange(${n},${i})">
+    <span class="pair-field-label">%</span>
+    <input type="number" id="pair-tp-pos-${n}-${i}" value="${tpPos}" min="1" max="100" step="1" style="width:64px" title="% of position to sell at TP" oninput="syncPairPos(${n},${i});updateTpSummary(${n})">
+    <span class="pair-field-label">% pos</span>
+  </div>
+  <div class="pair-side${trEn ? '' : ' disabled'}" id="pair-tr-${n}-${i}">
+    <span class="pair-tag trail">Trail</span>
+    <label class="toggle" style="flex-shrink:0;margin:0" title="Enable Trail">
+      <input type="checkbox" id="pair-tr-en-${n}-${i}" ${trEn ? 'checked' : ''} onchange="onPairSideToggle(${n},${i},'tr')">
+      <span class="slider"></span>
+    </label>
+    <span class="pair-sign" style="color:var(--green)">+</span>
+    <input type="number" id="pair-tr-act-${n}-${i}" value="${trAct}" min="0" step="1" style="width:64px" title="Activation % (must be &le; paired TP%)" oninput="validatePairActivation(${n},${i})">
+    <span class="pair-field-label">act%</span>
+    <span class="pair-sign" style="color:var(--red)">&minus;</span>
+    <input type="number" id="pair-tr-trail-${n}-${i}" value="${trTrail}" min="0.1" step="1" style="width:64px" title="Trail drop from peak %">
+    <span class="pair-field-label">trail%</span>
+    <input type="number" id="pair-tr-pos-${n}-${i}" value="${trPos}" min="1" max="100" step="1" style="width:64px" title="Mirrors TP position% automatically" class="pair-tr-pos-auto" readonly tabindex="-1">
+    <span class="pair-field-label">% pos <span style="font-size:9px;opacity:.6">(auto)</span></span>
+  </div>
 </div>`;
 }
+
+function onPairSideToggle(n, i, side) {
+  const en = document.getElementById(`pair-${side}-en-${n}-${i}`).checked;
+  const sideEl = document.getElementById(`pair-${side}-${n}-${i}`);
+  if (sideEl) sideEl.classList.toggle('disabled', !en);
+  updateTpSummary(n);
+}
+
+function updatePairHint(n, i) {
+  // Hints not shown inline in pair layout — keep for compat
+}
+
+// CHANGE 3: copy TP pos% into readonly Trail pos% field reactively
+function syncPairPos(n, i) {
+  const tpEl = document.getElementById(`pair-tp-pos-${n}-${i}`);
+  const trEl = document.getElementById(`pair-tr-pos-${n}-${i}`);
+  if (tpEl && trEl) trEl.value = tpEl.value;
+}
+
+// CHANGE 3: Trail activation% must not exceed paired TP price% (red border warning)
+function validatePairActivation(n, i) {
+  const tpEnEl    = document.getElementById(`pair-tp-en-${n}-${i}`);
+  const tpPriceEl = document.getElementById(`pair-tp-price-${n}-${i}`);
+  const actEl     = document.getElementById(`pair-tr-act-${n}-${i}`);
+  if (!actEl) return;
+  // Only enforce constraint when TP side is enabled
+  if (!tpEnEl?.checked || !tpPriceEl) { actEl.style.borderColor = ''; return; }
+  const tpPrice = parseFloat(tpPriceEl.value) || 0;
+  const act     = parseFloat(actEl.value)     || 0;
+  actEl.style.borderColor = act > tpPrice ? 'var(--red)' : '';
+}
+
+// CHANGE 3: when TP price% changes, revalidate Trail activation% constraint
+function onTpPriceChange(n, i) {
+  validatePairActivation(n, i);
+  updateTpSummary(n);
+}
+
+function addPairRow(n) {
+  const c = document.getElementById(`pair-rows-${n}`);
+  if (c.querySelectorAll('.pair-row').length >= 10) { toast('Max 10 TP/Trail pairs', true); return; }
+  const i = Date.now();
+  c.insertAdjacentHTML('beforeend', makePairRow(n, i, true, 20, 33, true, 0, 25, 33));
+  renumberRows(n);
+  updateTpSummary(n);
+}
+
+function removePairRow(n, i) {
+  const el = document.getElementById(`pair-row-${n}-${i}`);
+  if (el) el.remove();
+  renumberRows(n);
+  updateTpSummary(n);
+}
+
+// Legacy stubs (kept for backward compat if referenced elsewhere)
+function makeTpRow(n, i, price, pos) { return makePairRow(n, i, true, price, pos, false, 0, 25, pos); }
+function addTpRow(n) { addPairRow(n); }
+function removeTpRow(n, i) { removePairRow(n, i); }
 
 function makeSlRow(n, i, price, pos) {
   return `<div class="sl-row" id="sl-row-${n}-${i}">
-  <span class="row-label">-</span>
+  <span class="row-label">SL</span>
   <input type="number" id="sl-price-${n}-${i}" value="${price ?? 30}" min="0.1" step="1" placeholder="%" title="Price drop %">
   <span class="row-label">% |</span>
-  <input type="number" id="sl-pos-${n}-${i}" value="${pos ?? 100}" min="1" max="100" step="1" placeholder="%" title="Position %">
+  <input type="number" id="sl-pos-${n}-${i}" value="${pos ?? 100}" min="1" max="100" step="1" placeholder="%" title="Position %" oninput="updateTpSummary(${n})">
   <span class="row-label">% pos</span>
-  <button class="remove-btn" onclick="removeSlRow(${n},${i})" title="Remove">×</button>
+  <button class="remove-btn" onclick="removeSlRow(${n},${i})" title="Remove">&times;</button>
 </div>`;
 }
 
-function addTpRow(n) {
-  const container = document.getElementById(`tp-rows-${n}`);
-  const rows = container.querySelectorAll('.tp-row');
-  if (rows.length >= 8) { toast('Max 8 take profits', true); return; }
-  const i = Date.now();
-  container.insertAdjacentHTML('beforeend', makeTpRow(n, i, 50, 50));
-  updateTpSummary(n);
-}
-
-function removeTpRow(n, i) {
-  const el = document.getElementById(`tp-row-${n}-${i}`);
-  if (el) el.remove();
-  updateTpSummary(n);
-}
 
 function addSlRow(n) {
   const container = document.getElementById(`sl-rows-${n}`);
@@ -671,27 +1098,49 @@ function addSlRow(n) {
   if (rows.length >= 3) { toast('Max 3 stop losses', true); return; }
   const i = Date.now();
   container.insertAdjacentHTML('beforeend', makeSlRow(n, i, 30, 100));
+  renumberRows(n);
+  updateTpSummary(n);
 }
 
 function removeSlRow(n, i) {
   const el = document.getElementById(`sl-row-${n}-${i}`);
   if (el) el.remove();
+  renumberRows(n);
+  updateTpSummary(n);
 }
 
 function updateTpSummary(n) {
-  const container = document.getElementById(`tp-rows-${n}`);
-  const rows = container.querySelectorAll('.tp-row');
-  let total = 0;
-  rows.forEach(row => {
-    const id = row.id.split('-').slice(-1)[0];
-    const pos = parseFloat(document.getElementById(`tp-pos-${n}-${id}`)?.value || 0);
-    total += pos;
-  });
-  const moonbag = Math.max(0, 100 - total);
+  // CHANGE 4: sum ONLY enabled TP position% — Trail shares the same allocation, SL is independent
+  let tpTotal = 0;
+  const pairContainer = document.getElementById(`pair-rows-${n}`);
+  if (pairContainer) {
+    pairContainer.querySelectorAll('.pair-row').forEach(row => {
+      const i = row.id.split('-').slice(-1)[0];
+      if (document.getElementById(`pair-tp-en-${n}-${i}`)?.checked)
+        tpTotal += parseFloat(document.getElementById(`pair-tp-pos-${n}-${i}`)?.value || 0);
+    });
+  }
+  // SL total tracked separately — independent exit path
+  let slTotal = 0;
+  const slContainer = document.getElementById(`sl-rows-${n}`);
+  if (slContainer) {
+    slContainer.querySelectorAll('.sl-row').forEach(row => {
+      const id = row.id.split('-').slice(-1)[0];
+      slTotal += parseFloat(document.getElementById(`sl-pos-${n}-${id}`)?.value || 0);
+    });
+  }
+  // Moonbag = tokens not covered by any TP exit (SL is a separate exit path, not subtracted)
+  const moonbag = Math.max(0, 100 - tpTotal);
   const el = document.getElementById(`tp-summary-${n}`);
-  if (el) el.innerHTML = `Total closed: <b>${total.toFixed(0)}%</b> &nbsp;|&nbsp; Moonbag: <span class="moonbag"><b>${moonbag.toFixed(0)}%</b></span> stays in wallet`;
-  if (total > 100) el.style.color = 'var(--red)';
-  else el.style.color = '';
+  if (el) {
+    const tpColor = tpTotal > 100 ? 'var(--red)' : 'var(--green)';
+    const slColor = slTotal > 100 ? 'var(--red)' : 'var(--text)';
+    el.innerHTML =
+      `TP exits: <b style="color:${tpColor}">${tpTotal.toFixed(0)}%</b>` +
+      ` &nbsp;|&nbsp; SL exits: <b style="color:${slColor}">${slTotal.toFixed(0)}%</b>` +
+      ` &nbsp;|&nbsp; Moonbag: <span class="moonbag"><b>${moonbag.toFixed(0)}%</b></span>`;
+    el.style.color = (tpTotal > 100 || slTotal > 100) ? 'var(--red)' : '';
+  }
 }
 
 // ============================================================
@@ -707,17 +1156,26 @@ function readPreset(n) {
     return el ? el.checked : false;
   }
 
-  // Read TP rows
-  const tpContainer = document.getElementById(`tp-rows-${n}`);
+  // Read TP/Trail pairs
+  const pairContainer = document.getElementById(`pair-rows-${n}`);
   const tps = [];
-  if (tpContainer) {
-    tpContainer.querySelectorAll('.tp-row').forEach(row => {
-      const id = row.id.split('-').slice(-1)[0];
-      const price = parseFloat(document.getElementById(`tp-price-${n}-${id}`)?.value);
-      const pos = parseFloat(document.getElementById(`tp-pos-${n}-${id}`)?.value);
-      if (!isNaN(price) && !isNaN(pos) && price > 0 && pos > 0) {
-        tps.push({ price_pct: price, position_pct: pos });
-      }
+  const trails = [];
+  if (pairContainer) {
+    pairContainer.querySelectorAll('.pair-row').forEach(row => {
+      const i = row.id.split('-').slice(-1)[0];
+      const tpEn  = document.getElementById(`pair-tp-en-${n}-${i}`)?.checked ?? true;
+      const tpP   = parseFloat(document.getElementById(`pair-tp-price-${n}-${i}`)?.value);
+      const tpPos = parseFloat(document.getElementById(`pair-tp-pos-${n}-${i}`)?.value);
+      if (tpEn && !isNaN(tpP) && !isNaN(tpPos) && tpP > 0 && tpPos > 0)
+        tps.push({ price_pct: tpP, position_pct: tpPos });
+
+      const trEn    = document.getElementById(`pair-tr-en-${n}-${i}`)?.checked ?? true;
+      const trAct   = parseFloat(document.getElementById(`pair-tr-act-${n}-${i}`)?.value);
+      const trTrail = parseFloat(document.getElementById(`pair-tr-trail-${n}-${i}`)?.value);
+      // CHANGE 3: Trail pos% mirrors TP pos% — read from TP source of truth
+      const trPos   = parseFloat(document.getElementById(`pair-tp-pos-${n}-${i}`)?.value);
+      if (!isNaN(trAct) && !isNaN(trTrail) && !isNaN(trPos))
+        trails.push({ enabled: trEn, activation_pct: trAct, trail_size_pct: trTrail, position_pct: trPos });
     });
   }
 
@@ -735,44 +1193,41 @@ function readPreset(n) {
     });
   }
 
+  const feeModeEl = document.querySelector(`#fee-mode-row-${n} .fee-mode-btn.active-auto, #fee-mode-row-${n} .fee-mode-btn.active-superfast, #fee-mode-row-${n} .fee-mode-btn.active-ultra`);
+  const feeMode = feeModeEl ? (feeModeEl.classList.contains('active-auto') ? 'auto' : feeModeEl.classList.contains('active-superfast') ? 'superfast' : 'ultra') : 'auto';
+
   return {
     name: `Preset ${n}`,
     buy_amount_sol: v(`p${n}_buy_amount`),
-    priority_fee_sol: v(`p${n}_priority_fee`),
+    max_priority_fee_sol: v(`p${n}_priority_fee`),
     jito_tip_sol: v(`p${n}_jito_tip`),
     gas_fee_sol: v(`p${n}_gas_fee`),
     buy_slippage: v(`p${n}_buy_slippage`),
     sell_slippage: v(`p${n}_sell_slippage`),
     max_retries: Math.max(1, v(`p${n}_max_retries`)),
+    fee_mode: feeMode,
     take_profits: tps,
     stop_losses: sls,
-    trailing_stops: (() => {
-      const c = document.getElementById(`trail-rows-${n}`);
-      const stops = [];
-      if (c) c.querySelectorAll('.trail-row').forEach(row => {
-        const i = row.id.split('-').slice(-1)[0];
-        const act   = parseFloat(document.getElementById(`trail-act-${n}-${i}`)?.value);
-        const trail = parseFloat(document.getElementById(`trail-trail-${n}-${i}`)?.value);
-        const pos   = parseFloat(document.getElementById(`trail-pos-${n}-${i}`)?.value);
-        const en    = document.getElementById(`trail-en-${n}-${i}`)?.checked ?? true;
-        if (!isNaN(act) && !isNaN(trail) && !isNaN(pos))
-          stops.push({ enabled: en, activation_pct: act, trail_size_pct: trail, position_pct: pos });
-      });
-      return stops;
-    })(),
+    trailing_stops: trails,
     filters: {
       min_dev_buy_sol: v(`p${n}_min_dev_buy`),
       dev_buy_check_enabled: checked(`p${n}_dev_buy_check`),
       min_ath_last5: v(`p${n}_min_ath`),
       ath_require_all: checked(`p${n}_ath_require_all`),
+      ath_enabled: checked(`p${n}_ath_enabled`),
       min_migrations_last5: Math.round(v(`p${n}_min_mig`)),
+      migrations_enabled: checked(`p${n}_mig_enabled`),
       min_tx_count: Math.round(v(`p${n}_min_tx`)),
       max_tx_count: Math.round(v(`p${n}_max_tx`)),
       tx_count_require_all: checked(`p${n}_tx_require_all`),
+      tx_count_enabled: checked(`p${n}_tx_enabled`),
       min_lifetime_minutes: v(`p${n}_min_lifetime`),
       lifetime_require_all: checked(`p${n}_lt_require_all`),
+      lifetime_enabled: checked(`p${n}_lt_enabled`),
       min_entry_mc_usd: Math.round(v(`p${n}_min_entry_mc`)),
       max_entry_mc_usd: Math.round(v(`p${n}_max_entry_mc`)),
+      entry_mc_enabled: checked(`p${n}_mc_enabled`),
+      new_wallet_enabled: checked(`p${n}_new_wallet_enabled`),
     },
   };
 }
@@ -784,9 +1239,12 @@ async function savePreset(n) {
   if (!cfg) return;
   const preset = readPreset(n);
 
-  // Validate TP sum
+  // CHANGE 4: validate TP total independently — Trail shares TP's allocation, not counted separately
   const tpTotal = preset.take_profits.reduce((s, tp) => s + tp.position_pct, 0);
-  if (tpTotal > 100) { toast('Total TP position % exceeds 100%', true); return; }
+  if (tpTotal > 100) { toast(`TP total is ${tpTotal.toFixed(0)}% — max 100%`, true); return; }
+  // SL total is a separate independent exit path — validated independently
+  const slTotal = preset.stop_losses.reduce((s, sl) => s + sl.position_pct, 0);
+  if (slTotal > 100) { toast(`SL total is ${slTotal.toFixed(0)}% — max 100%`, true); return; }
 
   cfg.presets = cfg.presets || {};
   cfg.presets[String(n)] = preset;

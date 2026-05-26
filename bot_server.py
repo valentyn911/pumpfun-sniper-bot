@@ -13,10 +13,14 @@ import os
 import re
 import subprocess
 import threading
+import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+
+from filelock import FileLock
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
 CONFIG_FILE = PROJECT_ROOT / "bot_config.json"
@@ -94,6 +98,157 @@ DEFAULT_CONFIG = {
 }
 
 _config_lock = threading.Lock()
+_CONFIG_LOCK_FILE = CONFIG_FILE.with_suffix(".lock")
+
+# SOL price cache (60s TTL)
+_sol_price_cache: dict = {"price": 0.0, "ts": 0.0}
+_sol_price_lock = threading.Lock()
+
+# Fee recommendation cache (60s TTL)
+_fee_cache: dict = {"data": None, "ts": 0.0}
+_fee_cache_lock = threading.Lock()
+
+_FEE_CACHE_TTL = 60.0
+
+
+# ---------------------------------------------------------------------------
+# SOL price helpers
+# ---------------------------------------------------------------------------
+
+
+def get_sol_price_usd() -> float:
+    try:
+        url = "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read())
+            return float(data["price"])
+    except Exception:
+        try:
+            url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                data = json.loads(resp.read())
+                return float(data["solana"]["usd"])
+        except Exception:
+            return 0.0
+
+
+def get_sol_price_cached() -> tuple[float, float]:
+    """Return (price, age_seconds). Refreshes if cache is stale."""
+    with _sol_price_lock:
+        age = time.time() - _sol_price_cache["ts"]
+        if age < _FEE_CACHE_TTL and _sol_price_cache["ts"] > 0:
+            return _sol_price_cache["price"], age
+    price = get_sol_price_usd()
+    now = time.time()
+    with _sol_price_lock:
+        _sol_price_cache["price"] = price
+        _sol_price_cache["ts"] = now
+    return price, 0.0
+
+
+# ---------------------------------------------------------------------------
+# Fee estimation helpers
+# ---------------------------------------------------------------------------
+
+
+def _fetch_helius_priority_fee() -> int | None:
+    """Fetch Helius veryHigh priority fee estimate (µL/CU). Returns None on error."""
+    env = load_env()
+    helius_url = env.get("HELIUS_STAKED_URL") or env.get("SOLANA_NODE_RPC_ENDPOINT", "")
+    if not helius_url:
+        return None
+    payload = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getPriorityFeeEstimate",
+        "params": [{"accountKeys": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"], "options": {"priorityLevel": "veryHigh"}}],
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            helius_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        return int(data["result"]["priorityFeeEstimate"])
+    except Exception:
+        return None
+
+
+def _fetch_jito_tip_floor() -> int | None:
+    """Fetch Jito 75th-percentile tip floor (lamports). Returns None on error."""
+    try:
+        url = "https://bundles.jito.wtf/api/v1/bundles/tip_floor"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        if isinstance(data, list) and data:
+            # API returns values in SOL — convert to lamports
+            sol_val = float(data[0].get("landed_tips_75th_percentile", 0))
+            return int(sol_val * 1_000_000_000)
+        return None
+    except Exception:
+        return None
+
+
+def get_recommended_fees() -> dict:
+    """Return cached fee recommendation data, refreshing if stale."""
+    with _fee_cache_lock:
+        age = time.time() - _fee_cache["ts"]
+        if age < _FEE_CACHE_TTL and _fee_cache["data"] is not None:
+            return dict(_fee_cache["data"])
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_helius = ex.submit(_fetch_helius_priority_fee)
+        f_jito = ex.submit(_fetch_jito_tip_floor)
+        f_sol = ex.submit(get_sol_price_usd)
+        helius_ul = f_helius.result()
+        jito_lamps = f_jito.result()
+        sol_price = f_sol.result()
+
+    fetch_ms = int((time.time() - t0) * 1000)
+
+    # Priority fee in SOL: µL/CU × 85000 CU / 1e9
+    priority_fee_sol = round((helius_ul or 0) * 85_000 / 1_000_000_000, 9) if helius_ul else None
+    jito_tip_sol = round((jito_lamps or 0) / 1_000_000_000, 9) if jito_lamps else None
+    base_fee_sol = 0.000005  # 5000 lamports base tx fee
+
+    congestion = "unknown"
+    if helius_ul is not None:
+        if helius_ul < 500_000:
+            congestion = "low"
+        elif helius_ul < 2_000_000:
+            congestion = "medium"
+        else:
+            congestion = "high"
+
+    # Update SOL price cache too
+    if sol_price > 0:
+        now = time.time()
+        with _sol_price_lock:
+            _sol_price_cache["price"] = sol_price
+            _sol_price_cache["ts"] = now
+
+    result = {
+        "priority_fee_sol": priority_fee_sol,
+        "jito_tip_sol": jito_tip_sol,
+        "base_fee_estimate_sol": base_fee_sol,
+        "congestion": congestion,
+        "helius_very_high_ul_per_cu": helius_ul,
+        "jito_75th_percentile_lamports": jito_lamps,
+        "fetch_time_ms": fetch_ms,
+        "sol_price_usd": sol_price if sol_price > 0 else None,
+    }
+
+    with _fee_cache_lock:
+        _fee_cache["data"] = result
+        _fee_cache["ts"] = time.time()
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +257,7 @@ _config_lock = threading.Lock()
 
 
 def load_config() -> dict:
-    with _config_lock:
+    with _config_lock, FileLock(_CONFIG_LOCK_FILE):
         if CONFIG_FILE.exists():
             try:
                 with open(CONFIG_FILE) as f:
@@ -113,7 +268,7 @@ def load_config() -> dict:
 
 
 def save_config(data: dict) -> None:
-    with _config_lock:
+    with _config_lock, FileLock(_CONFIG_LOCK_FILE):
         with open(CONFIG_FILE, "w") as f:
             json.dump(data, f, indent=2)
 
@@ -321,6 +476,13 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/wallet":
             pubkey = get_public_key()
             self._send_json({"pubkey": pubkey})
+
+        elif path == "/api/recommended-fees":
+            self._send_json(get_recommended_fees())
+
+        elif path == "/api/sol-price":
+            price, age = get_sol_price_cached()
+            self._send_json({"sol_price_usd": price if price > 0 else None, "age_seconds": round(age, 1)})
 
         else:
             self._send_json({"error": "not found"}, 404)

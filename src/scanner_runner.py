@@ -16,7 +16,6 @@ import logging
 import os
 import re
 import struct
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -27,6 +26,7 @@ from typing import Any
 import aiohttp
 import yaml
 from dotenv import load_dotenv
+from filelock import AsyncFileLock
 
 try:
     import uvloop
@@ -38,6 +38,7 @@ except ImportError:
 from solders.pubkey import Pubkey
 
 from core.client import SolanaClient
+from core.priority_fee.helius_fee import HeliusFeeEstimator
 from core.priority_fee.manager import PriorityFeeManager
 from core.wallet import Wallet
 from interfaces.core import Platform, TokenInfo
@@ -56,8 +57,14 @@ BLACKLISTED_MINTS: frozenset[str] = frozenset({
     "DjrHJeQSrNQ31GEraBm3xmo3Eer963EiXuX7hpCuHnbm",  # phantom "USDC" garbage token
 })
 
+# Fee mode constants
+SUPERFAST_PRIORITY_UL_PER_CU = 10_000_000   # 850k lamports @ 85k CU = 0.000850 SOL
+SUPERFAST_JITO_LAMPORTS = 10_000_000         # 0.010 SOL
+ULTRA_PRIORITY_UL_PER_CU = 50_000_000        # 4.25M lamports @ 85k CU = 0.004250 SOL
+ULTRA_JITO_LAMPORTS = 25_000_000             # 0.025 SOL
+
 _BOT_CONFIG_PATH = Path(__file__).parent.parent / "bot_config.json"
-_config_lock = asyncio.Lock()
+_BOT_CONFIG_LOCK_PATH = _BOT_CONFIG_PATH.with_suffix(".lock")
 
 
 def _read_bot_config() -> dict[str, Any] | None:
@@ -71,8 +78,8 @@ def _read_bot_config() -> dict[str, Any] | None:
 
 
 async def _update_bot_config(updates: dict[str, Any]) -> None:
-    """Merge top-level keys and nested stats into bot_config.json."""
-    async with _config_lock:
+    """Merge top-level keys and nested stats into bot_config.json (cross-process safe)."""
+    async with AsyncFileLock(_BOT_CONFIG_LOCK_PATH):
         cfg = _read_bot_config() or {}
         for k, v in updates.items():
             if k == "stats" and isinstance(v, dict):
@@ -493,11 +500,55 @@ async def _fetch_token_signatures_batch(
 
 
 # ---------------------------------------------------------------------------
+# Helius-native migrations check (Поток 3b — fallback when GMGN unavailable)
+# ---------------------------------------------------------------------------
+
+
+async def _check_bc_migrations_native(mints: list[str], rpc: str) -> int:
+    """Count how many of dev's last N tokens have migrated (bonding curve complete=True).
+
+    Derives bonding-curve-v2 PDA for each mint, fetches BC account via Helius RPC,
+    reads the `complete` bool at byte 48 (BC v2 account is 83 bytes per CONTEXT §16).
+    All fetches run in parallel — latency ≈ single getAccountInfo call (~300-500 ms).
+    Returns migration count (0 if all fetches fail).
+    """
+    async def _one(mint_str: str) -> bool:
+        try:
+            bc_addr = str(PumpFunAddresses.find_bonding_curve_v2(Pubkey.from_string(mint_str)))
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getAccountInfo",
+                "params": [bc_addr, {"encoding": "base64", "commitment": "confirmed"}],
+            }
+            timeout = aiohttp.ClientTimeout(total=2.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(rpc, json=payload) as resp:
+                    data = await resp.json()
+            value = data.get("result", {}).get("value")
+            if not value:
+                return False  # BC not found → token dead / never existed
+            raw_data = value.get("data")
+            if not raw_data or not isinstance(raw_data, list):
+                return False
+            account_bytes = base64.b64decode(raw_data[0])
+            if len(account_bytes) < 56:
+                return False
+            # complete flag at byte 48 (bool, 8-byte padded field — see CONTEXT §16)
+            return account_bytes[48] == 1
+        except Exception as exc:
+            logger.debug(f"[mig_native] BC check failed for {mint_str[:8]}: {exc}")
+            return False
+
+    results = await asyncio.gather(*[_one(m) for m in mints[:5]], return_exceptions=True)
+    return sum(1 for r in results if r is True)
+
+
+# ---------------------------------------------------------------------------
 # GMGN CLI (Поток 3)
 # ---------------------------------------------------------------------------
 
 
-_GMGN_API_KEY: str = os.environ.get("GMGN_API_KEY", "")
 _GMGN_BASE_URL: str = "https://openapi.gmgn.ai/v1/user/created_tokens"
 
 
@@ -526,100 +577,110 @@ def _parse_gmgn_tokens(
 async def _get_gmgn_dev_tokens(dev_wallet: str, current_mint: str = "") -> tuple[list[TokenHistory], str | None]:
     """Fetch tokens created by dev wallet.
 
-    Primary path: direct GMGN OpenAPI HTTP call (~200 ms, zero subprocess overhead).
-    Fallback: gmgn-cli NPX subprocess (used when API key missing or HTTP fails).
-
-    Raises RuntimeError so caller can distinguish fetch failure from empty history.
+    Primary: GMGN OpenAPI HTTP (~200 ms when reachable).
+    4xx responses (Cloudflare IP/ASN block, invalid key) → skip HTTP retry immediately
+    and go straight to CLI, saving ~500 ms per token.
+    Fallback: gmgn-cli subprocess — reads ~/.config/gmgn/.env for auth, bypasses Cloudflare.
+    CLI output format: {"tokens": [...], "inner_count": N, ...} (dict, not bare list).
     """
-    import uuid  # stdlib, no overhead concern
+    import uuid
 
     label = dev_wallet[:8]
+    api_key = os.environ.get("GMGN_API_KEY", "")
+    params = {
+        "chain": "sol",
+        "wallet_address": dev_wallet,
+        "timestamp": int(time.time()),
+        "client_id": str(uuid.uuid4()),
+    }
+    headers = {"X-APIKEY": api_key, "Content-Type": "application/json"}
 
-    # ------------------------------------------------------------------
-    # Primary: direct HTTP to openapi.gmgn.ai
-    # ------------------------------------------------------------------
-    if _GMGN_API_KEY:
+    async def _http_attempt() -> tuple[list[TokenHistory], str | None]:
+        t0 = time.perf_counter()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                _GMGN_BASE_URL,
+                params=params,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=3.5),
+            ) as resp:
+                ms = int((time.perf_counter() - t0) * 1000)
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                payload = await resp.json(content_type=None)
+
+        if payload.get("code") != 0:
+            raise RuntimeError(f"API code={payload.get('code')} msg={payload.get('message')}")
+
+        raw_tokens = (payload.get("data") or {}).get("tokens") or []
+        total_field = (payload.get("data") or {}).get("total")
+        if isinstance(total_field, int) and total_field > 0:
+            gmgn_total: str = str(total_field)
+        else:
+            gmgn_total = f"{len(raw_tokens)}+" if raw_tokens else "0"
+        logger.info(f"[GMGN HTTP] {label}: {ms}ms, {len(raw_tokens)} tokens")
+        return _parse_gmgn_tokens(raw_tokens, current_mint), gmgn_total
+
+    async def _cli_fallback() -> tuple[list[TokenHistory], str | None]:
+        """npx gmgn-cli — reads ~/.config/gmgn/.env, bypasses Cloudflare IP block.
+        Returns {"tokens":[...],"inner_count":N,...} — a dict, not a bare list.
+        """
+        import json as _json
+        t0 = time.perf_counter()
+        proc = await asyncio.create_subprocess_exec(
+            "npx", "gmgn-cli", "portfolio", "created-tokens",
+            "--chain", "sol", "--wallet", dev_wallet, "--raw",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         try:
-            params = {
-                "chain": "sol",
-                "wallet_address": dev_wallet,
-                "timestamp": int(time.time()),
-                "client_id": str(uuid.uuid4()),
-            }
-            headers = {"X-APIKEY": _GMGN_API_KEY, "Content-Type": "application/json"}
-            t0 = time.perf_counter()
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    _GMGN_BASE_URL,
-                    params=params,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=3.0),
-                ) as resp:
-                    ms = int((time.perf_counter() - t0) * 1000)
-                    if resp.status != 200:
-                        raise RuntimeError(f"HTTP {resp.status}")
-                    payload = await resp.json(content_type=None)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=6.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("gmgn-cli timed out after 6s")
+        ms = int((time.perf_counter() - t0) * 1000)
+        if proc.returncode != 0:
+            raise RuntimeError(f"gmgn-cli exit {proc.returncode}: {stderr.decode()[:200]}")
+        result = _json.loads(stdout.decode())
+        # CLI returns a dict {"tokens": [...], "inner_count": N} — extract the list
+        if isinstance(result, list):
+            raw_tokens = result
+            inner_count = len(result)
+        elif isinstance(result, dict) and "tokens" in result:
+            raw_tokens = result.get("tokens") or []
+            inner_count = result.get("inner_count") or len(raw_tokens)
+        else:
+            raise RuntimeError(f"gmgn-cli unexpected output type: {type(result).__name__}: {stdout[:80]}")
+        gmgn_total = (
+            str(inner_count) if isinstance(inner_count, int) and inner_count > 0
+            else (f"{len(raw_tokens)}+" if raw_tokens else "0")
+        )
+        logger.info(f"[GMGN CLI] {label}: {ms}ms, {len(raw_tokens)} tokens (total={gmgn_total})")
+        return _parse_gmgn_tokens(raw_tokens, current_mint), gmgn_total
 
-            logger.debug(f"[GMGN HTTP] {label}... response in {ms}ms")
-            if payload.get("code") != 0:
-                raise RuntimeError(f"API code={payload.get('code')} msg={payload.get('message')}")
+    # HTTP attempt — Cloudflare blocks many IPs with 403/401 (error 1010 = ASN block).
+    # On any 4xx: skip retry immediately (retrying a blocked IP wastes ~500 ms).
+    _http_blocked = False
+    try:
+        return await _http_attempt()
+    except Exception as exc:
+        _http_blocked = "HTTP 4" in str(exc)  # 401, 403, 404, etc.
+        if _http_blocked:
+            logger.warning(f"[GMGN HTTP] {label}: blocked ({exc}) — going straight to CLI")
+        else:
+            logger.warning(f"[GMGN HTTP] {label}: attempt 1 failed ({exc}), retrying in 200ms")
 
-            raw_tokens = (payload.get("data") or {}).get("tokens") or []
-            total_field = (payload.get("data") or {}).get("total")
-            logger.debug(f"[GMGN HTTP] {label}... total={total_field}, page_size={len(raw_tokens)}")
-            if isinstance(total_field, int) and total_field > 0:
-                gmgn_total: str = str(total_field)
-            else:
-                gmgn_total = f"{len(raw_tokens)}+" if raw_tokens else "0"
-            return _parse_gmgn_tokens(raw_tokens, current_mint), gmgn_total
-
+    if not _http_blocked:
+        await asyncio.sleep(0.2)
+        try:
+            return await _http_attempt()
         except Exception as exc:
-            logger.warning(f"[GMGN HTTP] {label}... failed ({exc}), fallback to CLI")
-
-    # ------------------------------------------------------------------
-    # Fallback: gmgn-cli subprocess
-    # ------------------------------------------------------------------
-    loop = asyncio.get_event_loop()
-    try:
-        result = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: subprocess.run(
-                    [
-                        "npx", "gmgn-cli", "portfolio", "created-tokens",
-                        "--chain", "sol",
-                        "--wallet", dev_wallet,
-                        "--raw",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                ),
-            ),
-            timeout=4.0,
-        )
-    except (TimeoutError, asyncio.TimeoutError) as e:
-        raise RuntimeError("gmgn-cli timeout") from e
-    except Exception as e:
-        raise RuntimeError(f"gmgn-cli subprocess error: {e}") from e
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"gmgn-cli exit {result.returncode}: {result.stderr[:120]}"
-        )
+            logger.warning(f"[GMGN HTTP] {label}: attempt 2 failed ({exc}), falling back to CLI")
 
     try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"gmgn-cli invalid JSON: {e}") from e
-
-    raw_tokens_cli = data.get("tokens", [])
-    total_field_cli = data.get("total")
-    if isinstance(total_field_cli, int) and total_field_cli > 0:
-        gmgn_total_cli: str = str(total_field_cli)
-    else:
-        gmgn_total_cli = f"{len(raw_tokens_cli)}+" if raw_tokens_cli else "0"
-    return _parse_gmgn_tokens(raw_tokens_cli, current_mint), gmgn_total_cli
+        return await _cli_fallback()
+    except Exception as exc:
+        raise RuntimeError(f"GMGN: HTTP + CLI failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +695,8 @@ def format_token_alert(
     dev_buy_sol: float | None = None,
     token_history: list[TokenHistory] | None = None,
     gmgn_total: str | None = None,
+    gmgn_was_called: bool = True,
+    is_new_wallet: bool = False,
 ) -> str:
     mint_str = str(token_info.mint)
     creator = token_info.creator or token_info.user
@@ -677,27 +740,32 @@ def format_token_alert(
         f"📅 Возраст кошелька: {age}",
         f"💰 Баланс: {bal}",
         f"🚀 Всего запусков: {launches}",
-        f"💵 Дев купил при запуске: {dev_buy_str}",
-        "📦 Последние токены дева:",
     ]
+    if is_new_wallet:
+        lines.append("🆕 <b>New Dev Wallet</b> — first token launch")
+    lines.append(f"💵 Дев купил при запуске: {dev_buy_str}")
 
-    if token_history:
-        for i, th in enumerate(token_history, 1):
-            mig = (
-                "✅ Мигрировал" if th.migrated is True
-                else "❌ Нет" if th.migrated is False
-                else "—"
-            )
-            ath_str = _format_mc(th.ath_market_cap)
-            ath_highlight = (
-                " 💚" if th.ath_market_cap is not None and th.ath_market_cap >= 20_000
-                else ""
-            )
-            lines.append(
-                f"  {i}. {_escape_html(th.name)} — {mig} | ATH: {ath_str}{ath_highlight}"
-            )
+    if gmgn_was_called:
+        lines.append("📦 Последние токены дева:")
+        if token_history:
+            for i, th in enumerate(token_history, 1):
+                mig = (
+                    "✅ Мигрировал" if th.migrated is True
+                    else "❌ Нет" if th.migrated is False
+                    else "—"
+                )
+                ath_str = _format_mc(th.ath_market_cap)
+                ath_highlight = (
+                    " 💚" if th.ath_market_cap is not None and th.ath_market_cap >= 20_000
+                    else ""
+                )
+                lines.append(
+                    f"  {i}. {_escape_html(th.name)} — {mig} | ATH: {ath_str}{ath_highlight}"
+                )
+        else:
+            lines.append("  —")
     else:
-        lines.append("  —")
+        lines.append("📊 История дева: не проверялась (ATH/мигр. выключены)")
 
     lines.append("")
     lines.append(f"🕐 {_now_ms()}")
@@ -780,7 +848,7 @@ async def run_scanner(config_path: str) -> None:
             "⚠️  SOLANA_NODE_RPC_ENDPOINT не задан — on-chain проверка будет пропущена"
         )
 
-    logger.info("GMGN: используется gmgn-cli (ключ из ~/.config/gmgn/.env)")
+    logger.info("GMGN: используется HTTP API (2.5s timeout, 1 retry)")
 
     # -----------------------------------------------------------------------
     # Инициализация покупателя
@@ -1022,19 +1090,51 @@ async def run_scanner(config_path: str) -> None:
             )
 
         # Pre-read config to decide whether to run the signatures batch (stream 4).
-        # Avoids the fetch entirely when all three new filters are disabled (= 0).
         _pre_cfg = _read_bot_config() or {}
         _pre_filt = (
             (_pre_cfg.get("presets") or {})
             .get(str(_pre_cfg.get("active_preset", 1)), {})
             .get("filters", {})
         )
-        _need_sigs: bool = bool(rpc) and bool(creator_str) and (
+        _ath_enabled: bool = bool(_pre_filt.get("ath_enabled", True))
+        _mig_enabled: bool = bool(_pre_filt.get("migrations_enabled", True))
+        _tx_count_enabled: bool = bool(_pre_filt.get("tx_count_enabled", True))
+        _lifetime_enabled: bool = bool(_pre_filt.get("lifetime_enabled", True))
+        _pre_preset = ((_pre_cfg.get("presets") or {}).get(str(_pre_cfg.get("active_preset", 1)), {}))
+        _fee_mode_pre: str = str(_pre_preset.get("fee_mode", "auto")).lower()
+
+        # -----------------------------------------------------------------------
+        # FILTER TOGGLE ISOLATION — FETCH TRUTH TABLE
+        # Which underlying data fetches fire for each toggle combination:
+        #
+        # ath  mig  lt   tx  | GMGN call | Stream4 sigs | BC dev buy
+        # ─────────────────────────────────────────────────────────────────────
+        # ON   *    *    *   |   YES      |  if tx/lt ON |  if check ON
+        # OFF  ON   *    *   |   YES      |  if tx/lt ON |  if check ON
+        # OFF  OFF  ON   *   |   NO       |  if values>0 |  if check ON  ← lt uses Stream4 sigs
+        # OFF  OFF  OFF  ON  |   NO       |  if values>0 |  if check ON  ← TX uses dev.recent_tokens
+        # OFF  OFF  OFF  OFF |   NO       |      NO      |  if check ON
+        #
+        # GMGN fetch:    ath OR mig ONLY (need per-token ATH MC or migration status)
+        #                lifetime/TX use on-chain sigs (Stream4) — no GMGN needed
+        # Stream4 sigs:  (tx_count OR lifetime) AND has non-zero threshold
+        #                Source: GMGN histories when available, dev.recent_tokens as fallback
+        # BC buy fetch:  dev_buy_check_enabled=True AND dev_buy_sol not already from event
+        # MC check:      entry_mc_enabled=True AND auto_trading=True
+        # mig_task:      GMGN failed AND mig_enabled AND dev.recent_tokens available
+        # -----------------------------------------------------------------------
+
+        # skip_gmgn: GMGN needed ONLY for ATH (per-token ATH MC) and migrations (ATH≥35k proxy).
+        # Lifetime uses Stream4 create_timestamp; TX count only needs mint addresses.
+        skip_gmgn: bool = not (_ath_enabled or _mig_enabled)
+        # Stream 4 only needed when tx_count or lifetime filter is active AND has non-zero values
+        _need_sigs: bool = bool(rpc) and bool(creator_str) and (_tx_count_enabled or _lifetime_enabled) and (
             int(_pre_filt.get("min_tx_count", 0)) > 0
             or int(_pre_filt.get("max_tx_count", 0)) > 0
             or float(_pre_filt.get("min_lifetime_minutes", 0)) > 0
         )
         _dev_buy_check: bool = bool(_pre_filt.get("dev_buy_check_enabled", True))
+        logger.info(f"[#{count}] [PIPELINE] skip_gmgn={skip_gmgn} | need_sigs={_need_sigs} | dev_buy_check={_dev_buy_check}")
 
         # -------------------------------------------------------------------
         # Data fetch — all four tasks fire immediately in parallel at mint time.
@@ -1060,6 +1160,13 @@ async def run_scanner(config_path: str) -> None:
             _check_mint_freeze(mint_str, rpc) if rpc
             else asyncio.sleep(0, result=(False, False)),
         )
+        # Fire Helius dynamic fee estimation in parallel with Phase 1 (~200 ms).
+        # superfast/ultra modes use fixed fees — skip the API call entirely.
+        _helius_url = helius_staked_url or rpc
+        task_helius_fee: asyncio.Task = asyncio.create_task(
+            HeliusFeeEstimator().get_max_fee_microlamports(_helius_url)
+            if (_helius_url and _fee_mode_pre == "auto") else asyncio.sleep(0, result=None)
+        )
 
         dev = DevWalletInfo(address=creator_str, timed_out=True)
         dev_buy_sol: float | None = None
@@ -1069,15 +1176,21 @@ async def run_scanner(config_path: str) -> None:
         gmgn_total_launches: str | None = None
         sig_data: dict[str, tuple[int, int | None]] = {}
         phase1_ok = False
+        mig_task: asyncio.Task | None = None
+        helius_mig_count: int | None = None
 
         try:
             # Phase 1: GMGN + dev wallet run concurrently; task_bc_buy fires in background.
+            # When skip_gmgn=True (all dev-history filters disabled) GMGN call is skipped.
             dev_r, gmgn_r = await asyncio.wait_for(
                 asyncio.gather(
                     check_dev_wallet(creator_str, rpc) if (creator_str and rpc)
                     else asyncio.sleep(0, result=DevWalletInfo(address=creator_str or "")),
-                    _get_gmgn_dev_tokens(creator_str, current_mint=mint_str) if creator_str
-                    else asyncio.sleep(0, result=([], None)),
+                    asyncio.sleep(0, result=([], None)) if skip_gmgn
+                    else (
+                        _get_gmgn_dev_tokens(creator_str, current_mint=mint_str) if creator_str
+                        else asyncio.sleep(0, result=([], None))
+                    ),
                     return_exceptions=True,
                 ),
                 timeout=4.0,
@@ -1091,22 +1204,73 @@ async def run_scanner(config_path: str) -> None:
             if isinstance(dev_r, Exception):
                 logger.warning(f"[#{count}] Dev wallet check failed: {dev_r}")
 
-            gmgn_failed = isinstance(gmgn_r, Exception)
-            if gmgn_failed:
+            gmgn_failed = (not skip_gmgn) and isinstance(gmgn_r, Exception)
+            if isinstance(gmgn_r, Exception) and not skip_gmgn:
                 logger.warning(f"[#{count}] GMGN fetch failed for {mint_str[:8]}: {gmgn_r}")
                 histories = []
+            elif isinstance(gmgn_r, tuple):
+                histories, gmgn_total_launches = gmgn_r
+                histories = histories or []
             else:
-                if isinstance(gmgn_r, tuple):
-                    histories, gmgn_total_launches = gmgn_r
-                    histories = histories or []
-                else:
-                    histories = []
+                histories = []
 
             logger.info(
-                f"[#{count}] Phase1 (dev+GMGN): {(time.perf_counter()-t_fetch)*1000:.0f}ms"
+                f"[#{count}] Phase1 (dev{'[no GMGN]' if skip_gmgn else '+GMGN'}): "
+                f"{(time.perf_counter()-t_fetch)*1000:.0f}ms"
                 f" | GMGN: {len(histories)} tokens"
                 f"{' [GMGN FAILED]' if gmgn_failed else ''}"
             )
+
+            # BUG #2 FIX: GMGN returned empty (not error) but dev has recent tokens →
+            # likely GMGN indexing lag for a recently-created token, not a truly new wallet.
+            # One retry after 400ms. Skipped when dev has no recent activity (truly new wallet).
+            if (
+                not histories
+                and not gmgn_failed
+                and not skip_gmgn
+                and creator_str
+                and isinstance(dev, DevWalletInfo)
+                and dev.recent_tokens
+            ):
+                logger.info(
+                    f"[#{count}] GMGN empty + dev has {len(dev.recent_tokens)} recent token(s) "
+                    f"— retrying in 400ms (indexing lag check)"
+                )
+                await asyncio.sleep(0.4)
+                try:
+                    _retry_histories, _retry_total = await asyncio.wait_for(
+                        _get_gmgn_dev_tokens(creator_str, current_mint=mint_str),
+                        timeout=2.5,
+                    )
+                    if _retry_histories:
+                        histories = _retry_histories
+                        gmgn_total_launches = _retry_total
+                        logger.info(f"[#{count}] GMGN retry: {len(histories)} tokens (was empty — indexing lag confirmed)")
+                    else:
+                        logger.info(f"[#{count}] GMGN retry: still empty — new wallet confirmed")
+                except Exception as _retry_exc:
+                    logger.warning(f"[#{count}] GMGN retry failed: {_retry_exc}")
+
+            # Fire Helius-native migrations check immediately after Phase 1 using
+            # dev.recent_tokens (mints from getTransaction batch in check_dev_wallet).
+            # Runs concurrently with Stream 4 — ~300-500 ms, usually done before filter check.
+            if (
+                gmgn_failed
+                and _mig_enabled
+                and isinstance(dev, DevWalletInfo)
+                and dev.recent_tokens
+                and rpc
+            ):
+                _mig_mints = [t.mint for t in dev.recent_tokens[:5]]
+                mig_task = asyncio.create_task(_check_bc_migrations_native(_mig_mints, rpc))
+                logger.info(f"[#{count}] Helius migrations check started ({len(_mig_mints)} mints)")
+
+            # When GMGN was skipped (ATH+mig both OFF) and Stream4 needs mint sources,
+            # use dev.recent_tokens. Entries have no ATH/migration data — safe because
+            # those filter checks are disabled when skip_gmgn=True.
+            if skip_gmgn and _need_sigs and not histories and isinstance(dev, DevWalletInfo) and dev.recent_tokens:
+                histories = [TokenHistory(mint=t.mint, name=t.name) for t in dev.recent_tokens[:5]]
+                logger.debug(f"[#{count}] TX count: using dev.recent_tokens ({len(histories)} mints, GMGN skipped)")
 
             # Stream 4: BC signatures — sequential after GMGN, own 1.5 s timeout
             if _need_sigs and histories and rpc:
@@ -1127,10 +1291,22 @@ async def run_scanner(config_path: str) -> None:
             logger.warning(f"[#{count}] Phase1 timeout (4s) — sending with dashes")
             task_bc_buy.cancel()
             task_mint.cancel()
+            task_helius_fee.cancel()
         except Exception as e:
             logger.error(f"[#{count}] Phase1 fetch error: {e}")
             task_bc_buy.cancel()
             task_mint.cancel()
+            task_helius_fee.cancel()
+
+        # Bug #3A: Collect Helius fee (usually done by now; was fired in parallel with Phase 1)
+        _helius_fee_ul: int | None = None
+        if not task_helius_fee.cancelled():
+            try:
+                _helius_fee_ul = await asyncio.wait_for(task_helius_fee, timeout=0.1)
+            except (TimeoutError, asyncio.TimeoutError):
+                logger.debug(f"[#{count}] Helius fee still pending — will use cap")
+            except Exception as exc:
+                logger.debug(f"[#{count}] Helius fee collection error: {exc}")
 
         logger.info(f"[#{count}] Phase1+sigs: {(time.perf_counter()-t_total)*1000:.0f}ms")
 
@@ -1150,17 +1326,32 @@ async def run_scanner(config_path: str) -> None:
                 await tg.send_message(_reject("data fetch timeout"))
             return
 
-        if gmgn_failed:
-            logger.info(f"[#{count}] GMGN unavailable — rejecting")
+        # ATH filter requires GMGN — no Helius fallback exists for historical ATH data.
+        # Migrations filter can fall back to Helius BC complete-flag check (mig_task).
+        # tx_count / lifetime use on-chain sigs (stream 4), not GMGN histories.
+        if gmgn_failed and _ath_enabled and float(filt.get("min_ath_last5", 0)) > 0:
+            logger.info(f"[#{count}] GMGN failed + ATH filter active — rejecting (no Helius fallback for ATH)")
             if not _any_position_open:
                 await tg.send_message(_reject("GMGN data unavailable"))
             return
+        if gmgn_failed:
+            _fallback_info = "using Helius for migrations" if mig_task else "no ath/mig filters need it"
+            logger.info(f"[#{count}] GMGN unavailable — {_fallback_info}, continuing")
 
-        if not histories:
-            logger.info(f"[#{count}] GMGN returned no token history — rejecting")
-            if not _any_position_open:
-                await tg.send_message(_reject("GMGN: no token history for this dev"))
-            return
+        if not skip_gmgn and not gmgn_failed and not histories:
+            # Only reject on empty history when a filter with a non-zero threshold needs GMGN data.
+            # Lifetime and TX count use Stream4 — not GMGN — so they're excluded here.
+            _gmgn_data_required = (
+                (bool(filt.get("ath_enabled", True)) and float(filt.get("min_ath_last5", 0)) > 0)
+                or (bool(filt.get("migrations_enabled", True)) and int(filt.get("min_migrations_last5", 0)) > 0)
+            )
+            if _gmgn_data_required:
+                logger.info(f"[#{count}] New wallet — no previous token history (required for active filters)")
+                if not _any_position_open:
+                    await tg.send_message(_reject("New wallet — no previous tokens"))
+                return
+            else:
+                logger.info(f"[#{count}] GMGN: new wallet, no history — no filter requires it, continuing")
 
         dev_data_missing = (
             dev.sol_balance is None
@@ -1173,6 +1364,17 @@ async def run_scanner(config_path: str) -> None:
                 await tg.send_message(_reject("dev data unavailable"))
             return
 
+        # -------------------------------------------------------------------
+        # FILTER: New Wallet (new_wallet_enabled)
+        # is_new_wallet = histories is empty AND dev.total_launches == 0
+        # OFF → silent discard (debug log only, zero extra RPC calls)
+        # ON  → new wallets pass through and continue to remaining filters
+        # -------------------------------------------------------------------
+        is_new_wallet = (not histories) and (dev.total_launches == 0)
+        if is_new_wallet and not bool(filt.get("new_wallet_enabled", True)):
+            logger.info(f"[#{count}] Silent skip: new wallet, toggle OFF — {mint_str[:8]}")
+            return
+
         min_ath = float(filt.get("min_ath_last5", 0))
         min_mig = int(filt.get("min_migrations_last5", 0))
 
@@ -1181,7 +1383,7 @@ async def run_scanner(config_path: str) -> None:
         # ath_require_all=False → at least one token must meet the threshold
         # ath_require_all=True  → every token must meet the threshold
         # -------------------------------------------------------------------
-        if min_ath > 0 and histories:
+        if bool(filt.get("ath_enabled", True)) and min_ath > 0 and histories:
             ath_require_all = bool(filt.get("ath_require_all", False))
             if ath_require_all:
                 failing = [h for h in histories if (h.ath_market_cap or 0.0) < min_ath]
@@ -1207,18 +1409,41 @@ async def run_scanner(config_path: str) -> None:
                         ))
                     return
 
+        # Collect Helius-native migrations result (fired after Phase 1 using dev.recent_tokens).
+        # Task has been running concurrently with Stream 4 — usually already done here.
+        if mig_task is not None and not mig_task.cancelled():
+            try:
+                helius_mig_count = (
+                    mig_task.result() if mig_task.done()
+                    else await asyncio.wait_for(mig_task, timeout=1.0)
+                )
+                logger.info(f"[#{count}] Helius migrations: {helius_mig_count}/5")
+            except (TimeoutError, asyncio.TimeoutError):
+                logger.warning(f"[#{count}] Helius migrations check timed out after 1s")
+            except Exception as exc:
+                logger.warning(f"[#{count}] Helius migrations check error: {exc}")
+
         # -------------------------------------------------------------------
         # FILTER 4: Migrations count
+        # Priority: GMGN histories → Helius native → skip (no data → pass)
         # -------------------------------------------------------------------
-        if min_mig > 0 and histories:
-            mig_count = sum(1 for h in histories if h.migrated is True)
+        if bool(filt.get("migrations_enabled", True)) and min_mig > 0:
+            if histories:
+                mig_count = sum(1 for h in histories if h.migrated is True)
+                mig_src = f"{len(histories)} GMGN tokens"
+            elif helius_mig_count is not None:
+                mig_count = helius_mig_count
+                mig_src = "Helius BC check"
+            else:
+                mig_count = min_mig  # no data → treat as passing (don't reject on missing data)
+                mig_src = "no data"
             if mig_count < min_mig:
                 logger.info(
-                    f"[#{count}] Filter: migrations {mig_count} < {min_mig} → skip"
+                    f"[#{count}] Filter: migrations {mig_count} < {min_mig} ({mig_src}) → skip"
                 )
                 if not _any_position_open:
                     await tg.send_message(_reject(
-                        f"Migrations {mig_count}/{len(histories)} (min {min_mig})"
+                        f"Migrations {mig_count}/5 (min {min_mig})"
                     ))
                 return
 
@@ -1228,7 +1453,9 @@ async def run_scanner(config_path: str) -> None:
         # -------------------------------------------------------------------
         min_tx = int(filt.get("min_tx_count", 0))
         max_tx = int(filt.get("max_tx_count", 0))
-        if (min_tx > 0 or max_tx > 0) and sig_data and histories:
+        if not bool(filt.get("tx_count_enabled", True)):
+            logger.debug(f"[#{count}] TX COUNT FILTER: SKIPPED (toggle OFF)")
+        if bool(filt.get("tx_count_enabled", True)) and (min_tx > 0 or max_tx > 0) and sig_data and histories:
             tx_require_all = bool(filt.get("tx_count_require_all", False))
 
             def _tx_range_str() -> str:
@@ -1275,7 +1502,9 @@ async def run_scanner(config_path: str) -> None:
         # FILTER 6: Token lifetime in minutes for dev's last 5 tokens
         # -------------------------------------------------------------------
         min_lifetime = float(filt.get("min_lifetime_minutes", 0))
-        if min_lifetime > 0 and sig_data and histories:
+        if not bool(filt.get("lifetime_enabled", True)):
+            logger.debug(f"[#{count}] LIFETIME FILTER: SKIPPED (toggle OFF)")
+        if bool(filt.get("lifetime_enabled", True)) and min_lifetime > 0 and sig_data and histories:
             lifetime_require_all = bool(filt.get("lifetime_require_all", False))
 
             def _lifetime_minutes(h: TokenHistory) -> float | None:
@@ -1390,7 +1619,12 @@ async def run_scanner(config_path: str) -> None:
         # Build the full message with a ✅ header
         full_message = (
             "✅ ПРОШЁЛ ВСЕ ФИЛЬТРЫ\n"
-            + format_token_alert(token_info, count, dev, dev_buy_sol, histories, gmgn_total=gmgn_total_launches)
+            + format_token_alert(
+                token_info, count, dev, dev_buy_sol, histories,
+                gmgn_total=gmgn_total_launches,
+                gmgn_was_called=not skip_gmgn,
+                is_new_wallet=is_new_wallet,
+            )
         )
 
         # Auto-buy block
@@ -1412,10 +1646,43 @@ async def run_scanner(config_path: str) -> None:
             else:
                 cur_buy_amount = float(preset.get("buy_amount_sol", buy_amount_sol))
                 cur_slippage = float(preset.get("buy_slippage", buy_slippage * 100)) / 100
-                cur_priority_sol = float(preset.get("priority_fee_sol", priority_fee_sol))
-                cur_priority_ul = int(cur_priority_sol * 1_000_000_000)
-                cur_jito_tip_sol = float(preset.get("jito_tip_sol", 0.003))
-                cur_jito_tip_ul = int(cur_jito_tip_sol * 1_000_000_000) if cur_jito_tip_sol > 0 else None
+                fee_mode = str(preset.get("fee_mode", "auto")).lower()
+                if fee_mode == "superfast":
+                    cur_priority_ul = SUPERFAST_PRIORITY_UL_PER_CU
+                    cur_jito_tip_ul = SUPERFAST_JITO_LAMPORTS
+                    logger.info(
+                        f"[#{count}] 🚀 SUPER FAST: priority={cur_priority_ul}µL/CU "
+                        f"jito={cur_jito_tip_ul} lamports total≈0.010855 SOL"
+                    )
+                elif fee_mode == "ultra":
+                    cur_priority_ul = ULTRA_PRIORITY_UL_PER_CU
+                    cur_jito_tip_ul = ULTRA_JITO_LAMPORTS
+                    logger.info(
+                        f"[#{count}] ⚡ ULTRA: priority={cur_priority_ul}µL/CU "
+                        f"jito={cur_jito_tip_ul} lamports total≈0.029255 SOL"
+                    )
+                else:  # "auto" — Helius dynamic + cap
+                    cur_max_priority_sol = float(
+                        preset.get("max_priority_fee_sol")
+                        or preset.get("priority_fee_sol")
+                        or priority_fee_sol
+                    )
+                    cap_ul = int(cur_max_priority_sol * 1_000_000_000)
+                    if _helius_fee_ul is not None:
+                        final_fee_ul = min(_helius_fee_ul, cap_ul)
+                        logger.info(
+                            f"[#{count}] Priority fee: {final_fee_ul} µL/CU "
+                            f"(helius={_helius_fee_ul}, cap={cap_ul})"
+                        )
+                    else:
+                        final_fee_ul = cap_ul
+                        logger.info(
+                            f"[#{count}] Priority fee: {final_fee_ul} µL/CU (helius=N/A, cap={cap_ul})"
+                        )
+                    cur_priority_ul = final_fee_ul
+                    cur_jito_tip_sol = float(preset.get("jito_tip_sol", 0.003))
+                    cur_jito_tip_ul = int(cur_jito_tip_sol * 1_000_000_000) if cur_jito_tip_sol > 0 else None
+                cur_priority_sol = cur_priority_ul / 1_000_000_000
 
                 from core.priority_fee.manager import PriorityFeeManager as _PFM
                 fresh_pf = _PFM(
@@ -1453,9 +1720,14 @@ async def run_scanner(config_path: str) -> None:
                     await _update_bot_config({"open_positions": _gate_open + 1})
                     open_pos = _gate_open  # snapshot before increment, for failure path decrement
 
-                mc_passes, mc_skip_msg = await _check_entry_mc(
-                    filt, bc_str, rpc, f"#{count}"
-                )
+                # Bug #5: skip Entry MC check when entry_mc_enabled=False
+                _entry_mc_enabled = bool(filt.get("entry_mc_enabled", True))
+                if _entry_mc_enabled:
+                    mc_passes, mc_skip_msg = await _check_entry_mc(
+                        filt, bc_str, rpc, f"#{count}"
+                    )
+                else:
+                    mc_passes, mc_skip_msg = True, ""
                 if not mc_passes:
                     await _update_bot_config({"open_positions": max(0, open_pos)})
                     buy_block = mc_skip_msg
@@ -1529,8 +1801,9 @@ async def run_scanner(config_path: str) -> None:
                                 f"📊 MC входа: {_format_mc(mc_at_entry)}",
                             ]
                             buy_lines += [
-                                f"💸 Комиссии: priority {cur_priority_sol:.5f} + jito {cur_jito_tip_sol:.5f} + gas {gas_fee_sol:.5f} = {total_fees_sol:.5f} SOL" + (f" (${total_fees_sol * sol_usd:.3f})" if sol_usd > 0 else ""),
+                                f"💸 Комиссии входа: priority {cur_priority_sol:.5f} + jito {cur_jito_tip_sol:.5f} + gas {gas_fee_sol:.5f} = {total_fees_sol:.5f} SOL" + (f" (${total_fees_sol * sol_usd:.3f})" if sol_usd > 0 else ""),
                                 f"💼 Итого: {total_out_sol:.6f} SOL" + (f" (${total_out_sol * sol_usd:.2f})" if sol_usd > 0 else ""),
+                                "⚠️ Gap risk: цена обновляется только при торгах. Резервный опрос каждые 2с.",
                             ]
                             if exit_lines:
                                 buy_lines.append("📈 Стратегия выхода:")
@@ -1559,6 +1832,8 @@ async def run_scanner(config_path: str) -> None:
                                         entry_time=time.monotonic(),
                                         sol_price_getter=lambda: _sol_price_usd,
                                         position_close_fn=None,
+                                        buy_commission_sol=total_fees_sol,
+                                        entry_mc_usd=mc_at_entry or 0.0,
                                     )
                                 )
                             else:
@@ -1624,9 +1899,9 @@ async def run_scanner(config_path: str) -> None:
                 )
                 logger.info(f"[#{count}] [TEST MC DEBUG] simulated_entry_mc: ${simulated_entry_mc:.0f}")
 
-                # MC range check — same filter as live mode, applied at simulated entry price
-                _mc_min_t = float(filt.get("min_entry_mc_usd", 0))
-                _mc_max_t = float(filt.get("max_entry_mc_usd", 0))
+                # MC range check — same filter as live mode; skip when entry_mc_enabled=False
+                _mc_min_t = float(filt.get("min_entry_mc_usd", 0)) if bool(filt.get("entry_mc_enabled", True)) else 0
+                _mc_max_t = float(filt.get("max_entry_mc_usd", 0)) if bool(filt.get("entry_mc_enabled", True)) else 0
                 if _mc_min_t > 0 and simulated_entry_mc < _mc_min_t:
                     _cfg_revert = _read_bot_config() or {}
                     await _update_bot_config({"open_positions": max(0, int(_cfg_revert.get("open_positions", 1)) - 1)})
@@ -1652,8 +1927,19 @@ async def run_scanner(config_path: str) -> None:
 
                 test_buy_amount = float(preset.get("buy_amount_sol", 0.01))
                 sim_tokens = test_buy_amount / simulated_entry_price
-                test_priority = float(preset.get("priority_fee_sol", 0.001))
-                test_jito = float(preset.get("jito_tip_sol", 0.003))
+                _test_fee_mode = str(preset.get("fee_mode", "auto")).lower()
+                if _test_fee_mode == "superfast":
+                    test_priority = SUPERFAST_PRIORITY_UL_PER_CU / 1_000_000_000
+                    test_jito = SUPERFAST_JITO_LAMPORTS / 1_000_000_000
+                elif _test_fee_mode == "ultra":
+                    test_priority = ULTRA_PRIORITY_UL_PER_CU / 1_000_000_000
+                    test_jito = ULTRA_JITO_LAMPORTS / 1_000_000_000
+                else:
+                    test_priority = float(
+                        preset.get("max_priority_fee_sol")
+                        or preset.get("priority_fee_sol", 0.001)
+                    )
+                    test_jito = float(preset.get("jito_tip_sol", 0.003))
                 test_gas = float(preset.get("gas_fee_sol", 0.00005))
                 test_fees = test_priority + test_jito + test_gas
                 test_total = test_buy_amount + test_fees
@@ -1681,8 +1967,9 @@ async def run_scanner(config_path: str) -> None:
                 ]
                 test_buy_lines += [
                     f"💰 Вложено (симуляция): {test_buy_amount:.6f} SOL → {sim_tokens:.4f} токенов",
-                    f"💸 Комиссии (не выплачены): priority {test_priority:.5f} + jito {test_jito:.5f} + gas {test_gas:.5f} = {test_fees:.5f} SOL",
+                    f"💸 Комиссии входа (симуляция): priority {test_priority:.5f} + jito {test_jito:.5f} + gas {test_gas:.5f} = {test_fees:.5f} SOL",
                     f"💼 Итого (симуляция): {test_total:.6f} SOL",
+                    "⚠️ Gap risk: цена обновляется только при торгах. Резервный опрос каждые 2с.",
                     "📈 Стратегия выхода:",
                 ]
                 if test_exit_tp:
